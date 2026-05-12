@@ -85,7 +85,7 @@ MODEL_REMAPPING = {
     "cohere_asr": "cohere_asr",
     "fireredasr2": "fireredasr2",
     "glm": "glmasr",
-    "mimo_v2_asr": "mimo_v2_asr",
+    "mimo": "mimo_v2_asr",
     "sensevoice": "sensevoice",
     "voxtral": "voxtral",
     "voxtral_realtime": "voxtral_realtime",
@@ -107,20 +107,6 @@ MODEL_REMAPPING = {
     "higgs_audio_3": "higgs_audio_3",
     "moss_music": "moss_music",
 }
-
-
-def _looks_like_mimo(model_name: list[str] | None, config: dict | None) -> bool:
-    if config:
-        architectures = config.get("architectures") or []
-        if isinstance(architectures, list) and any(
-            "MiMoV2ASR" in str(arch) for arch in architectures
-        ):
-            return True
-    for part in model_name or []:
-        lowered = part.lower()
-        if "mimo" in lowered:
-            return True
-    return False
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -219,10 +205,9 @@ def load_model(
         kwargs["model_type"] = "phonon"
 
     return base_load_model(
-        model_path=resolved_path,
+        model_path=model_path,
         category="stt",
         model_remapping=MODEL_REMAPPING,
-        model_name_parts=model_name,
         lazy=lazy,
         strict=strict,
         **kwargs,
