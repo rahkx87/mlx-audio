@@ -76,8 +76,6 @@ def split_audio_into_chunks(
     Returns:
         List of (chunk_waveform, offset_seconds) tuples.
     """
-    _validate_audio(wav)
-
     # Ensure mono
     if wav.ndim > 1:
         wav = wav.mean(axis=-1) if wav.shape[-1] <= 2 else wav.mean(axis=0)
@@ -928,12 +926,16 @@ class Qwen3ASRModel(nn.Module):
         text: str,
     ) -> Tuple[str, str]:
         """Extract language from text."""
-        if "<asr_text>" in text and text.startswith("language "):
-            language, transcript = text.split("<asr_text>", 1)
-            language = language[len("language ") :].strip()
-            if language.lower() == "none":
-                return "", transcript.strip()
-            return language, transcript
+        stripped_text = text.strip()
+        if "<asr_text>" in stripped_text:
+            metadata, transcript = stripped_text.split("<asr_text>", 1)
+            for line in metadata.splitlines():
+                line = line.strip()
+                if line.lower().startswith("language "):
+                    language = line[len("language ") :].strip()
+                    if language.lower() == "none":
+                        return "", transcript.strip()
+                    return language, transcript.strip()
         return "English", text
 
     def _build_prompt(
@@ -1547,7 +1549,7 @@ class Qwen3ASRModel(nn.Module):
         end_time = time.time()
 
         # Combine transcriptions
-        full_text = " ".join(all_texts)
+        full_text = " ".join(text for text in all_texts if text).strip()
 
         return STTOutput(
             text=full_text,
