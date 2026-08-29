@@ -218,12 +218,17 @@ def save_as_json(segments, output_path: str):
             "segments": [],
         }
         for s in segments.segments:
-            seg = {"text": s["text"]}
-            # Speaker-only segments (e.g. Granite SAA) carry no timing
-            if "start" in s:
-                seg["start"] = s["start"]
-                seg["end"] = s["end"]
-                seg["duration"] = s["end"] - s["start"]
+            duration = (
+                s["end"] - s["start"]
+                if s["start"] is not None and s["end"] is not None
+                else None
+            )
+            seg = {
+                "text": s["text"],
+                "start": s["start"],
+                "end": s["end"],
+                "duration": duration,
+            }
             # Add word-level timestamps if available
             if "words" in s and s["words"]:
                 seg["words"] = s["words"]
@@ -298,6 +303,7 @@ def generate_transcription(
         all_segments = []
         accumulated_text = ""
         pending_text = ""
+        pending_is_final = False
         language = "en"
         prompt_tokens = 0
         generation_tokens = 0
@@ -305,6 +311,7 @@ def generate_transcription(
             # Accumulate text (handles both incremental and cumulative streaming)
             accumulated_text += result.text
             pending_text += result.text
+            pending_is_final = pending_is_final or result.is_final
             language = result.language
 
             # Untimed text is committed when the model emits a timed boundary.
@@ -321,12 +328,25 @@ def generate_transcription(
                         }
                     )
                 pending_text = ""
+                pending_is_final = False
 
             # Extract token counts from results (final result has cumulative totals)
             if hasattr(result, "prompt_tokens") and result.prompt_tokens > 0:
                 prompt_tokens = result.prompt_tokens
             if hasattr(result, "generation_tokens") and result.generation_tokens > 0:
                 generation_tokens = result.generation_tokens
+
+        if pending_text:
+            if format in {"srt", "vtt"}:
+                raise ValueError("Cannot write untimed streaming text as SRT or VTT")
+            all_segments.append(
+                {
+                    "text": pending_text,
+                    "start": None,
+                    "end": None,
+                    "is_final": pending_is_final,
+                }
+            )
 
         stream_end_time = time.time()
         stream_duration = stream_end_time - start_time
