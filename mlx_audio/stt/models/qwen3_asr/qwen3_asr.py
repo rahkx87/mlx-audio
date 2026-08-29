@@ -24,8 +24,8 @@ class StreamingResult:
     Attributes:
         text: Decoded text for this emission.
         is_final: True if this is a final (committed) result, False if partial.
-        start_time: Start timestamp in seconds.
-        end_time: End timestamp in seconds.
+        start_time: Start timestamp in seconds, or None for untimed text.
+        end_time: End timestamp in seconds, or None for untimed text.
         language: Language of the transcription.
         prompt_tokens: Total prompt tokens (only set on final result).
         generation_tokens: Total generation tokens (only set on final result).
@@ -33,8 +33,8 @@ class StreamingResult:
 
     text: str
     is_final: bool
-    start_time: float
-    end_time: float
+    start_time: Optional[float]
+    end_time: Optional[float]
     language: str = "en"
     prompt_tokens: int = 0
     generation_tokens: int = 0
