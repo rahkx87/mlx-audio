@@ -40,8 +40,16 @@ class StreamingResult:
     generation_tokens: int = 0
 
 
+def _validate_audio(wav: np.ndarray) -> None:
+    if wav.size == 0:
+        raise ValueError("Audio input must contain at least one sample")
+    if not np.isfinite(wav).all():
+        raise ValueError("Audio input must contain only finite samples")
+
+
 def _audio_duration(wav: np.ndarray, sr: int) -> float:
     """Return the duration before model-only padding is applied."""
+    _validate_audio(wav)
     if wav.ndim > 1 and wav.shape[-1] > 2:
         return wav.shape[-1] / sr
     return len(wav) / sr
@@ -68,6 +76,8 @@ def split_audio_into_chunks(
     Returns:
         List of (chunk_waveform, offset_seconds) tuples.
     """
+    _validate_audio(wav)
+
     # Ensure mono
     if wav.ndim > 1:
         wav = wav.mean(axis=-1) if wav.shape[-1] <= 2 else wav.mean(axis=0)
@@ -883,12 +893,18 @@ class Qwen3ASRModel(nn.Module):
         """Preprocess audio for the model."""
         from mlx_audio.stt.utils import load_audio
 
+        audio_input = audio[0] if isinstance(audio, list) else audio
+
         if isinstance(audio, list):
             raise ValueError("Audio preprocessing expects one input")
-        if isinstance(audio, str):
-            audio = load_audio(audio)
 
-        audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
+        if isinstance(audio_input, str):
+            audio_input = load_audio(audio_input)
+
+        audio_np = (
+            np.array(audio_input) if isinstance(audio_input, mx.array) else audio_input
+        )
+        _validate_audio(audio_np)
 
         audio_inputs = self._feature_extractor(
             audio_np,
@@ -910,13 +926,14 @@ class Qwen3ASRModel(nn.Module):
     def extract_language(
         self,
         text: str,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """Extract language from text."""
         if "<asr_text>" in text and text.startswith("language "):
-            return (
-                text[len("language ") : text.find("<asr_text>")].strip(),
-                text[text.find("<asr_text>") + len("<asr_text>") :],
-            )
+            language, transcript = text.split("<asr_text>", 1)
+            language = language[len("language ") :].strip()
+            if language.lower() == "none":
+                return "", transcript.strip()
+            return language, transcript
         return "English", text
 
     def _build_prompt(
@@ -1402,9 +1419,13 @@ class Qwen3ASRModel(nn.Module):
             )
 
         # Load audio
-        if isinstance(audio, str):
-            audio = load_audio(audio)
-        audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
+        audio_input = audio[0] if isinstance(audio, list) else audio
+        if isinstance(audio_input, str):
+            audio_input = load_audio(audio_input)
+        audio_np = (
+            np.array(audio_input) if isinstance(audio_input, mx.array) else audio_input
+        )
+        total_duration = _audio_duration(audio_np, self.sample_rate)
 
         # Split into chunks if needed
         chunks = split_audio_into_chunks(
@@ -1465,7 +1486,11 @@ class Qwen3ASRModel(nn.Module):
                         "text": text,
                         "language": chunk_language,
                         "start": offset_sec,
-                        "end": offset_sec + len(chunk_audio) / self.sample_rate,
+                        "end": offset_sec
+                        + min(
+                            len(chunk_audio) / self.sample_rate,
+                            max(total_duration - offset_sec, 0.0),
+                        ),
                     }
                 )
             chunks = []  # skip the sequential loop below
@@ -1478,7 +1503,10 @@ class Qwen3ASRModel(nn.Module):
             if remaining_tokens <= 0:
                 break
 
-            actual_chunk_duration = len(chunk_audio) / self.sample_rate
+            actual_chunk_duration = min(
+                len(chunk_audio) / self.sample_rate,
+                max(total_duration - offset_sec, 0.0),
+            )
 
             text, prompt_toks, gen_toks = self._generate_single_chunk(
                 chunk_audio,
@@ -1584,7 +1612,7 @@ class Qwen3ASRModel(nn.Module):
             audio = load_audio(audio)
         audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
 
-        # Calculate duration before model-only padding.
+        # Calculate duration before short inputs are padded for the model.
         total_duration = _audio_duration(audio_np, self.sample_rate)
 
         # Split into chunks if needed
