@@ -112,6 +112,32 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output streamed.wav
 ```
 
+#### Custom Voices
+
+**`POST /v1/audio/voices`**
+
+Upload a reference audio sample. It is stored in the `speakers/` directory (override with the `MLX_AUDIO_SPEAKERS_DIR` environment variable), and the response includes the saved `filepath`, which can be passed as `ref_audio` to `/v1/audio/speech`.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/voices \
+  -F "name=My new voice" \
+  -F "consent=cons_1234" \
+  -F "audio_sample=@audio_sample.wav;type=audio/x-wav"
+```
+
+```json
+{
+  "id": "voice_3f2a...",
+  "created_at": 1760385600,
+  "name": "My new voice",
+  "object": "audio.voice",
+  "type": "audio_sample",
+  "filepath": "/path/to/speakers/voice_3f2a....wav"
+}
+```
+
+`consent` is accepted for OpenAI compatibility but is not verified. Only `type=audio_sample` is supported.
+
 ### Speech-to-Text
 
 **`POST /v1/audio/transcriptions`**

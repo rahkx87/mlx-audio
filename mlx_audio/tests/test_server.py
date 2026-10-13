@@ -3,6 +3,7 @@ import inspect
 import io
 import json
 import queue
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
@@ -1014,3 +1015,57 @@ async def test_stream_inference_results_reraises_error_by_default():
 
     assert exc_info.value is error
     assert handle.cancelled
+
+
+def test_create_voice_stores_sample(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+    payload = b"RIFF fake wav bytes"
+
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "My new voice", "consent": "cons_1234"},
+        files={"audio_sample": ("../evil.wav", payload, "audio/x-wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "audio.voice"
+    assert body["type"] == "audio_sample"
+    assert body["name"] == "My new voice"
+    assert body["id"].startswith("voice_")
+    assert isinstance(body["created_at"], int)
+    saved = Path(body["filepath"])
+    assert saved.parent == tmp_path.resolve()
+    assert saved.name == f"{body['id']}.wav"
+    assert saved.read_bytes() == payload
+
+
+def test_create_voice_rejects_unsupported_extension(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x"},
+        files={"audio_sample": ("sample.exe", b"data", "application/octet-stream")},
+    )
+    assert response.status_code == 400
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_create_voice_rejects_empty_sample(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x"},
+        files={"audio_sample": ("sample.wav", b"", "audio/x-wav")},
+    )
+    assert response.status_code == 400
+
+
+def test_create_voice_rejects_unknown_type(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x", "type": "other"},
+        files={"audio_sample": ("sample.wav", b"data", "audio/x-wav")},
+    )
+    assert response.status_code == 400

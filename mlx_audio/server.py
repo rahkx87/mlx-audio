@@ -1033,6 +1033,78 @@ async def tts_voices(model: Optional[str] = None):
     }
 
 
+ALLOWED_VOICE_SAMPLE_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".webm",
+}
+
+
+def get_speakers_dir() -> Path:
+    return Path(os.environ.get("MLX_AUDIO_SPEAKERS_DIR", "speakers")).resolve()
+
+
+@app.post("/v1/audio/voices")
+async def create_voice(
+    name: str = Form(...),
+    audio_sample: UploadFile = File(...),
+    consent: Optional[str] = Form(None),
+    type: str = Form("audio_sample"),
+):
+    """Create a custom voice by storing the uploaded audio sample.
+
+    The sample is saved in the speakers directory and its path is returned
+    so it can be passed as ``ref_audio`` to ``/v1/audio/speech``.
+    ``consent`` is accepted for OpenAI API compatibility but not verified.
+    """
+    if type != "audio_sample":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported voice type: {type}. Only 'audio_sample' is supported.",
+        )
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name must not be empty")
+
+    extension = Path(audio_sample.filename or "").suffix.lower() or ".wav"
+    if extension not in ALLOWED_VOICE_SAMPLE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported audio_sample file type: {extension}. Supported: "
+                f"{', '.join(sorted(ALLOWED_VOICE_SAMPLE_EXTENSIONS))}"
+            ),
+        )
+
+    data = await audio_sample.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="audio_sample is empty")
+
+    voice_id = f"voice_{uuid.uuid4().hex}"
+    speakers_dir = get_speakers_dir()
+    filepath = speakers_dir / f"{voice_id}{extension}"
+    try:
+        speakers_dir.mkdir(parents=True, exist_ok=True)
+        filepath.write_bytes(data)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to store audio sample: {e}"
+        )
+
+    return {
+        "id": voice_id,
+        "created_at": int(time.time()),
+        "name": name,
+        "object": "audio.voice",
+        "type": "audio_sample",
+        "filepath": str(filepath),
+    }
+
+
 @app.post("/v1/audio/transcriptions")
 async def stt_transcriptions(
     request: Request,
