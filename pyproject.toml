@@ -26,6 +26,7 @@ dependencies = [
     "numpy>=1.26.4",
     "openai>=3.37.0",
     "scipy>=1.10.0",
+    "sentencepiece>=0.2.0",
     "sounddevice>=0.5.3",
     "torch>=2.14.1",
     "tqdm>=4.67.1",
@@ -35,14 +36,12 @@ dependencies = [
 [project.optional-dependencies]
 # STT dependencies
 stt = [
-    "sentencepiece>=0.2.0",
     "zstandard>=0.23.0",
 ]
 
 # TTS dependencies
 tts = [
     "mistral-common[audio]",
-    "sentencepiece>=0.2.0",
 ]
 
 # Server dependencies
@@ -56,8 +55,6 @@ server = [
 
 # STS (Speech-to-Speech) dependencies
 sts = [
-    "sentencepiece>=0.2.0",
-
     # The speech-to-speech pipeline's default responder loads an arbitrary chat
     # model, which is mlx-lm's job; every other use is vendored in mlx_audio/lm.
     "mlx-lm>=0.31.1",
@@ -69,7 +66,6 @@ sts = [
 # Full installation (all features)
 all = [
     "mistral-common[audio]",
-    "sentencepiece>=0.2.0",
     "zstandard>=0.23.0",
 
     "mlx-lm>=0.31.1",
