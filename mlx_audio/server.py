@@ -1084,19 +1084,21 @@ async def create_voice(
     if not data:
         raise HTTPException(status_code=400, detail="audio_sample is empty")
 
-    voice_id = f"voice_{uuid.uuid4().hex}"
+    filename = Path(audio_sample.filename or "missing")
     speakers_dir = get_speakers_dir()
-    filepath = speakers_dir / f"{voice_id}{extension}"
+    filepath = speakers_dir.joinpath(filename)
+
     try:
-        speakers_dir.mkdir(parents=True, exist_ok=True)
-        filepath.write_bytes(data)
+        if not os.path.exists(filepath):
+            with open(filepath, "wb") as buffer:
+                buffer.write(data)
     except OSError as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to store audio sample: {e}"
         )
 
     return {
-        "id": voice_id,
+        "id": name,
         "created_at": int(time.time()),
         "name": name,
         "object": "audio.voice",
