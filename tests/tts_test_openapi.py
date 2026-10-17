@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:7860"
 TTS_ENDPOINT = "/v1/audio/speech"
 VOICES_ENDPOINT = "/v1/audio/voices"
 
