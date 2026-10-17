@@ -349,6 +349,18 @@ for item in result:
 
 See the [Qwen3-ASR README](mlx_audio/stt/models/qwen3_asr/README.md) for CLI usage, all models, and more examples.
 
+### MiMo-V2.5-ASR
+
+```python
+from mlx_audio.stt import load
+
+model = load("mlx-community/MiMo-V2.5-ASR-MLX")
+result = model.generate("audio.wav", language="en")
+print(result.text)
+```
+
+See the [MiMo-V2.5-ASR README](mlx_audio/stt/models/mimo_v2_asr/README.md) for local-path loading.
+
 ### Phonon-1
 
 Fermion Research's compact English Qwen3-ASR derivatives load directly from
