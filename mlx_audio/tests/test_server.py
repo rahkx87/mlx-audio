@@ -1017,8 +1017,25 @@ async def test_stream_inference_results_reraises_error_by_default():
     assert handle.cancelled
 
 
-def test_create_voice_stores_sample(client, tmp_path, monkeypatch):
+@pytest.fixture
+def speakers_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+    return tmp_path.resolve()
+
+
+@pytest.fixture
+def openai_client(client):
+    openai = pytest.importorskip("openai")
+    return openai.OpenAI(
+        api_key="test", base_url="http://testserver/v1", http_client=client
+    )
+
+
+def _voice_metadata(speakers_dir: Path, voice_id: str) -> dict:
+    return json.loads((speakers_dir / f"{voice_id}.json").read_text())
+
+
+def test_create_voice_stores_sample(client, speakers_dir):
     payload = b"RIFF fake wav bytes"
 
     response = client.post(
@@ -1034,25 +1051,51 @@ def test_create_voice_stores_sample(client, tmp_path, monkeypatch):
     assert body["name"] == "My new voice"
     assert body["id"].startswith("voice_")
     assert isinstance(body["created_at"], int)
+    assert "prompt" not in body
     saved = Path(body["filepath"])
-    assert saved.parent == tmp_path.resolve()
+    assert saved.parent == speakers_dir
     assert saved.name == f"{body['id']}.wav"
     assert saved.read_bytes() == payload
+    metadata = _voice_metadata(speakers_dir, body["id"])
+    assert metadata["consent"] == "cons_1234"
+    assert metadata["original_filename"] == "../evil.wav"
 
 
-def test_create_voice_rejects_unsupported_extension(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+def test_create_voice_creates_missing_speakers_dir(client, tmp_path, monkeypatch):
+    target = tmp_path / "nested" / "speakers"
+    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(target))
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x", "consent": "cons_1"},
+        files={"audio_sample": ("sample.flac", b"fLaC data", "audio/flac")},
+    )
+    assert response.status_code == 200
+    assert Path(response.json()["filepath"]).parent == target.resolve()
+
+
+def test_create_voice_uses_mime_type_when_filename_has_no_extension(
+    client, speakers_dir
+):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x", "consent": "cons_1"},
+        files={"audio_sample": ("upload", b"\xff\xfb data", "audio/mpeg")},
+    )
+    assert response.status_code == 200
+    assert response.json()["filepath"].endswith(".mp3")
+
+
+def test_create_voice_rejects_unsupported_extension(client, speakers_dir):
     response = client.post(
         "/v1/audio/voices",
         data={"name": "x"},
         files={"audio_sample": ("sample.exe", b"data", "application/octet-stream")},
     )
     assert response.status_code == 400
-    assert list(tmp_path.iterdir()) == []
+    assert list(speakers_dir.iterdir()) == []
 
 
-def test_create_voice_rejects_empty_sample(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+def test_create_voice_rejects_empty_sample(client, speakers_dir):
     response = client.post(
         "/v1/audio/voices",
         data={"name": "x"},
@@ -1061,11 +1104,144 @@ def test_create_voice_rejects_empty_sample(client, tmp_path, monkeypatch):
     assert response.status_code == 400
 
 
-def test_create_voice_rejects_unknown_type(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(tmp_path))
+def test_create_voice_rejects_oversized_sample(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x", "consent": "cons_1"},
+        files={
+            "audio_sample": (
+                "sample.wav",
+                b"0" * (10 * 1024 * 1024 + 1),
+                "audio/x-wav",
+            )
+        },
+    )
+    assert response.status_code == 413
+    assert list(speakers_dir.iterdir()) == []
+
+
+def test_create_voice_requires_sample_for_audio_sample_type(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "x", "consent": "cons_1", "type": "audio_sample"},
+    )
+    assert response.status_code == 400
+    assert "audio_sample" in response.json()["detail"]
+
+
+def test_create_voice_rejects_audio_sample_in_json(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        json={"name": "x", "consent": "cons_1", "audio_sample": "AAAA"},
+    )
+    assert response.status_code == 400
+
+
+def test_create_voice_rejects_blank_name(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"name": "   "},
+        files={"audio_sample": ("sample.wav", b"RIFF", "audio/x-wav")},
+    )
+    assert response.status_code == 400
+    assert "name" in response.json()["detail"]
+
+
+def test_create_voice_rejects_unknown_type(client, speakers_dir):
     response = client.post(
         "/v1/audio/voices",
         data={"name": "x", "type": "other"},
         files={"audio_sample": ("sample.wav", b"data", "audio/x-wav")},
     )
     assert response.status_code == 400
+
+
+def test_create_voice_rejects_unsupported_content_type(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        content=b"name=x",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert response.status_code == 415
+
+
+def test_create_voice_from_prompt_json(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        json={
+            "type": "prompt",
+            "name": "Narrator",
+            "prompt": "A calm, warm baritone narrator.",
+            "model": "2026-10-08",
+            "script_hint": "Once upon a time, in a land far away.",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "audio.voice"
+    assert body["type"] == "prompt"
+    assert body["name"] == "Narrator"
+    assert body["prompt"] == "A calm, warm baritone narrator."
+    assert body["id"].startswith("voice_")
+    assert "filepath" not in body
+    metadata = _voice_metadata(speakers_dir, body["id"])
+    assert metadata["model"] == "2026-10-08"
+    assert metadata["script_hint"] == "Once upon a time, in a land far away."
+
+
+def test_create_voice_from_prompt_multipart(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"type": "prompt", "name": "Narrator", "prompt": "Bright and fast."},
+        files={"unused": ("unused.txt", b"", "text/plain")},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "prompt"
+    assert _voice_metadata(speakers_dir, body["id"])["model"] == "auto"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "prompt", "name": "x"},
+        {"type": "prompt", "name": "x", "prompt": "   "},
+        {"type": "prompt", "name": "x", "prompt": "ok", "script_hint": "  "},
+        {"type": "prompt", "name": "", "prompt": "ok"},
+    ],
+)
+def test_create_voice_rejects_invalid_prompt_request(client, speakers_dir, payload):
+    response = client.post("/v1/audio/voices", json=payload)
+    assert response.status_code == 400
+    assert list(speakers_dir.iterdir()) == []
+
+
+def test_create_voice_openai_sdk_audio_sample(openai_client, speakers_dir):
+    voice = openai_client.audio.voices.create(
+        audio_sample=b"RIFF\x00\x00\x00\x00WAVEfmt ",
+        consent="cons_1234",
+        name="SDK voice",
+    )
+
+    assert voice.object == "audio.voice"
+    assert voice.type == "audio_sample"
+    assert voice.name == "SDK voice"
+    assert voice.prompt is None
+    assert (speakers_dir / f"{voice.id}.wav").exists()
+
+
+def test_create_voice_openai_sdk_prompt(openai_client, speakers_dir):
+    voice = openai_client.audio.voices.create(
+        name="SDK prompt voice",
+        prompt="A cheerful young voice.",
+        type="prompt",
+        model="auto",
+        script_hint="Hello there, it is a lovely day today.",
+    )
+
+    assert voice.type == "prompt"
+    assert voice.prompt == "A cheerful young voice."
+    assert _voice_metadata(speakers_dir, voice.id)["script_hint"] == (
+        "Hello there, it is a lovely day today."
+    )

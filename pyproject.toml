@@ -24,6 +24,7 @@ dependencies = [
     "miniaudio>=1.61",
     "mlx>=0.31.1",
     "numpy>=1.26.4",
+    "openai>=3.37.0",
     "scipy>=1.10.0",
     "sounddevice>=0.5.3",
     "torch>=2.14.1",

@@ -116,7 +116,19 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 **`POST /v1/audio/voices`**
 
-Upload a reference audio sample. It is stored in the `speakers/` directory (override with the `MLX_AUDIO_SPEAKERS_DIR` environment variable), and the response includes the saved `filepath`, which can be passed as `ref_audio` to `/v1/audio/speech`.
+Compatible with the OpenAI `client.audio.voices.create(...)` API. Voices are stored in the `speakers/` directory (override with the `MLX_AUDIO_SPEAKERS_DIR` environment variable). Each voice also gets a `<voice_id>.json` metadata file there.
+
+| Field | `type=audio_sample` (default) | `type=prompt` |
+|-------|-------------------------------|---------------|
+| `name` | required | required |
+| `audio_sample` | required file, max 10 MiB (`audio/mpeg`, `audio/wav`, `audio/x-wav`, `audio/ogg`, `audio/aac`, `audio/flac`, `audio/webm`, `audio/mp4`) | – |
+| `consent` | consent recording ID (accepted, not verified) | – |
+| `prompt` | – | required, non-blank voice description |
+| `model` | – | optional, defaults to `auto` |
+| `script_hint` | – | optional, non-blank if provided |
+| Encoding | `multipart/form-data` | JSON, `multipart/form-data` or urlencoded form |
+
+Upload a reference audio sample. The response includes the saved `filepath`, which can be passed as `ref_audio` to `/v1/audio/speech`:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/voices \
@@ -136,7 +148,26 @@ curl -X POST http://localhost:8000/v1/audio/voices \
 }
 ```
 
-`consent` is accepted for OpenAI compatibility but is not verified. Only `type=audio_sample` is supported.
+Create a voice from a text description. The response includes `prompt` (no `filepath`). The description can be passed as `instruct` to voice-design capable TTS models:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/voices \
+  -H "Content-Type: application/json" \
+  -d '{"type": "prompt", "name": "Narrator", "prompt": "A calm, warm baritone narrator."}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+voice = client.audio.voices.create(
+    audio_sample=open("audio_sample.wav", "rb"),
+    consent="cons_1234",
+    name="My new voice",
+)
+```
+
+Validation errors return `400`, samples over 10 MiB return `413`, and unsupported `Content-Type` headers return `415`.
 
 ### Speech-to-Text
 
