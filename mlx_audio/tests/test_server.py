@@ -1031,46 +1031,122 @@ def openai_client(client):
     )
 
 
-def _voice_metadata(speakers_dir: Path, voice_id: str) -> dict:
-    return json.loads((speakers_dir / f"{voice_id}.json").read_text())
+def _post_sample(client, name, payload, filename="sample.wav", **fields):
+    return client.post(
+        "/v1/audio/voices",
+        data={"name": name, **fields},
+        files={"audio_sample": (filename, payload, "audio/wav")},
+    )
 
 
-def test_create_voice_stores_sample(client, speakers_dir):
+def test_create_voice_stores_sample_under_name(client, speakers_dir):
     payload = b"RIFF fake wav bytes"
 
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "My new voice", "consent": "cons_1234"},
-        files={"audio_sample": ("../evil.wav", payload, "audio/x-wav")},
+    response = _post_sample(
+        client, "femaleyoungeager", payload, "../evil-3f2a.wav", consent="cons_1"
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["object"] == "audio.voice"
     assert body["type"] == "audio_sample"
-    assert body["name"] == "My new voice"
-    assert body["id"].startswith("voice_")
+    assert body["name"] == "femaleyoungeager"
+    assert body["id"] == "femaleyoungeager"
     assert isinstance(body["created_at"], int)
     assert "prompt" not in body
     saved = Path(body["filepath"])
-    assert saved.parent == speakers_dir
-    assert saved.name == f"{body['id']}.wav"
+    assert saved == speakers_dir / "femaleyoungeager.wav"
     assert saved.read_bytes() == payload
-    metadata = _voice_metadata(speakers_dir, body["id"])
-    assert metadata["consent"] == "cons_1234"
-    assert metadata["original_filename"] == "../evil.wav"
+    assert [path.name for path in speakers_dir.iterdir()] == ["femaleyoungeager.wav"]
+
+
+def test_create_voice_reuses_stored_sample_without_overwriting(client, speakers_dir):
+    first = _post_sample(client, "speaker", b"RIFF original", "a.wav")
+    second = _post_sample(client, "speaker", b"RIFF changed", "b.wav")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert (speakers_dir / "speaker.wav").read_bytes() == b"RIFF original"
+    assert [path.name for path in speakers_dir.iterdir()] == ["speaker.wav"]
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        None,
+        {"audio_sample": ("speaker.wav", b"", "audio/wav")},
+        {"audio_sample": ("upload", b"", "application/octet-stream")},
+    ],
+    ids=["no-file", "empty-file", "empty-generic-file"],
+)
+def test_create_voice_reuses_stored_sample_without_upload(client, speakers_dir, files):
+    stored = speakers_dir / "speaker.flac"
+    stored.write_bytes(b"fLaC existing")
+
+    response = client.post("/v1/audio/voices", data={"name": "speaker"}, files=files)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filepath"] == str(stored)
+    assert body["id"] == "speaker"
+    assert stored.read_bytes() == b"fLaC existing"
+    assert [path.name for path in speakers_dir.iterdir()] == ["speaker.flac"]
+
+
+@pytest.mark.parametrize(
+    "files",
+    [None, {"audio_sample": ("sample.wav", b"", "audio/wav")}],
+    ids=["no-file", "empty-file"],
+)
+def test_create_voice_requires_sample_for_new_voice(client, speakers_dir, files):
+    response = client.post("/v1/audio/voices", data={"name": "unknown"}, files=files)
+
+    assert response.status_code == 400
+    assert "audio_sample" in response.json()["detail"]
+    assert list(speakers_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("femaleyoungeager.wav", "femaleyoungeager.wav"),
+        ("../../etc/passwd", "etc_passwd.wav"),
+        ("My new voice", "My new voice.wav"),
+    ],
+)
+def test_create_voice_sanitizes_name_for_storage(client, speakers_dir, name, expected):
+    response = _post_sample(client, name, b"RIFF data")
+
+    assert response.status_code == 200
+    assert response.json()["name"] == name
+    assert Path(response.json()["filepath"]) == speakers_dir / expected
+
+
+def test_create_voice_accepts_client_field_aliases(client, speakers_dir):
+    response = client.post(
+        "/v1/audio/voices",
+        data={"title": "aliased", "audio_type": "audio_sample"},
+        files={"audio_sample": ("sample.wav", b"RIFF data", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "aliased"
+    assert (speakers_dir / "aliased.wav").is_file()
 
 
 def test_create_voice_creates_missing_speakers_dir(client, tmp_path, monkeypatch):
     target = tmp_path / "nested" / "speakers"
     monkeypatch.setenv("MLX_AUDIO_SPEAKERS_DIR", str(target))
+
     response = client.post(
         "/v1/audio/voices",
         data={"name": "x", "consent": "cons_1"},
         files={"audio_sample": ("sample.flac", b"fLaC data", "audio/flac")},
     )
+
     assert response.status_code == 200
-    assert Path(response.json()["filepath"]).parent == target.resolve()
+    assert Path(response.json()["filepath"]) == target.resolve() / "x.flac"
 
 
 def test_create_voice_uses_mime_type_when_filename_has_no_extension(
@@ -1078,11 +1154,12 @@ def test_create_voice_uses_mime_type_when_filename_has_no_extension(
 ):
     response = client.post(
         "/v1/audio/voices",
-        data={"name": "x", "consent": "cons_1"},
+        data={"name": "x"},
         files={"audio_sample": ("upload", b"\xff\xfb data", "audio/mpeg")},
     )
+
     assert response.status_code == 200
-    assert response.json()["filepath"].endswith(".mp3")
+    assert Path(response.json()["filepath"]).name == "x.mp3"
 
 
 def test_create_voice_rejects_unsupported_extension(client, speakers_dir):
@@ -1091,42 +1168,16 @@ def test_create_voice_rejects_unsupported_extension(client, speakers_dir):
         data={"name": "x"},
         files={"audio_sample": ("sample.exe", b"data", "application/octet-stream")},
     )
+
     assert response.status_code == 400
     assert list(speakers_dir.iterdir()) == []
-
-
-def test_create_voice_rejects_empty_sample(client, speakers_dir):
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "x"},
-        files={"audio_sample": ("sample.wav", b"", "audio/x-wav")},
-    )
-    assert response.status_code == 400
 
 
 def test_create_voice_rejects_oversized_sample(client, speakers_dir):
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "x", "consent": "cons_1"},
-        files={
-            "audio_sample": (
-                "sample.wav",
-                b"0" * (10 * 1024 * 1024 + 1),
-                "audio/x-wav",
-            )
-        },
-    )
+    response = _post_sample(client, "x", b"0" * (10 * 1024 * 1024 + 1))
+
     assert response.status_code == 413
     assert list(speakers_dir.iterdir()) == []
-
-
-def test_create_voice_requires_sample_for_audio_sample_type(client, speakers_dir):
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "x", "consent": "cons_1", "type": "audio_sample"},
-    )
-    assert response.status_code == 400
-    assert "audio_sample" in response.json()["detail"]
 
 
 def test_create_voice_rejects_audio_sample_in_json(client, speakers_dir):
@@ -1134,25 +1185,21 @@ def test_create_voice_rejects_audio_sample_in_json(client, speakers_dir):
         "/v1/audio/voices",
         json={"name": "x", "consent": "cons_1", "audio_sample": "AAAA"},
     )
+
     assert response.status_code == 400
 
 
-def test_create_voice_rejects_blank_name(client, speakers_dir):
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "   "},
-        files={"audio_sample": ("sample.wav", b"RIFF", "audio/x-wav")},
-    )
+@pytest.mark.parametrize("name", ["   ", "...", "///"])
+def test_create_voice_rejects_unusable_name(client, speakers_dir, name):
+    response = _post_sample(client, name, b"RIFF data")
+
     assert response.status_code == 400
-    assert "name" in response.json()["detail"]
+    assert list(speakers_dir.iterdir()) == []
 
 
 def test_create_voice_rejects_unknown_type(client, speakers_dir):
-    response = client.post(
-        "/v1/audio/voices",
-        data={"name": "x", "type": "other"},
-        files={"audio_sample": ("sample.wav", b"data", "audio/x-wav")},
-    )
+    response = _post_sample(client, "x", b"data", type="other")
+
     assert response.status_code == 400
 
 
@@ -1162,6 +1209,7 @@ def test_create_voice_rejects_unsupported_content_type(client, speakers_dir):
         content=b"name=x",
         headers={"Content-Type": "text/plain"},
     )
+
     assert response.status_code == 415
 
 
@@ -1182,24 +1230,29 @@ def test_create_voice_from_prompt_json(client, speakers_dir):
     assert body["object"] == "audio.voice"
     assert body["type"] == "prompt"
     assert body["name"] == "Narrator"
+    assert body["id"] == "Narrator"
     assert body["prompt"] == "A calm, warm baritone narrator."
-    assert body["id"].startswith("voice_")
     assert "filepath" not in body
-    metadata = _voice_metadata(speakers_dir, body["id"])
-    assert metadata["model"] == "2026-10-08"
-    assert metadata["script_hint"] == "Once upon a time, in a land far away."
+    stored = json.loads((speakers_dir / "Narrator.json").read_text())
+    assert stored["model"] == "2026-10-08"
+    assert stored["script_hint"] == "Once upon a time, in a land far away."
 
 
-def test_create_voice_from_prompt_multipart(client, speakers_dir):
-    response = client.post(
+def test_create_voice_from_prompt_reuses_stored_prompt(client, speakers_dir):
+    first = client.post(
         "/v1/audio/voices",
         data={"type": "prompt", "name": "Narrator", "prompt": "Bright and fast."},
         files={"unused": ("unused.txt", b"", "text/plain")},
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["type"] == "prompt"
-    assert _voice_metadata(speakers_dir, body["id"])["model"] == "auto"
+    second = client.post(
+        "/v1/audio/voices",
+        json={"type": "prompt", "name": "Narrator", "prompt": "Something else."},
+    )
+
+    assert first.status_code == 200
+    assert second.json() == first.json()
+    assert second.json()["prompt"] == "Bright and fast."
+    assert [path.name for path in speakers_dir.iterdir()] == ["Narrator.json"]
 
 
 @pytest.mark.parametrize(
@@ -1213,6 +1266,7 @@ def test_create_voice_from_prompt_multipart(client, speakers_dir):
 )
 def test_create_voice_rejects_invalid_prompt_request(client, speakers_dir, payload):
     response = client.post("/v1/audio/voices", json=payload)
+
     assert response.status_code == 400
     assert list(speakers_dir.iterdir()) == []
 
@@ -1227,8 +1281,9 @@ def test_create_voice_openai_sdk_audio_sample(openai_client, speakers_dir):
     assert voice.object == "audio.voice"
     assert voice.type == "audio_sample"
     assert voice.name == "SDK voice"
+    assert voice.id == "SDK voice"
     assert voice.prompt is None
-    assert (speakers_dir / f"{voice.id}.wav").exists()
+    assert (speakers_dir / "SDK voice.wav").exists()
 
 
 def test_create_voice_openai_sdk_prompt(openai_client, speakers_dir):
@@ -1242,6 +1297,4 @@ def test_create_voice_openai_sdk_prompt(openai_client, speakers_dir):
 
     assert voice.type == "prompt"
     assert voice.prompt == "A cheerful young voice."
-    assert _voice_metadata(speakers_dir, voice.id)["script_hint"] == (
-        "Hello there, it is a lovely day today."
-    )
+    assert (speakers_dir / "SDK prompt voice.json").is_file()

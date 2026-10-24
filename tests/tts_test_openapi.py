@@ -9,9 +9,8 @@ BASE_URL = "http://localhost:7860"
 TTS_ENDPOINT = "/v1/audio/speech"
 VOICES_ENDPOINT = "/v1/audio/voices"
 
-# Run from the repository root, where the server resolves its "speakers" directory.
-REFERENCE_VOICE = Path("femaleyoungeager.wav")
-SPEAKERS_DIR = Path("speakers")
+REFERENCE_VOICE = Path(__file__).with_name("femaleyoungeager.wav")
+VOICE_NAME = "femaleyoungeager"
 
 
 def _extract_filename(headers, default="output.wav"):
@@ -49,22 +48,25 @@ def _extract_filename(headers, default="output.wav"):
 
 
 def upload_voice(
-    sample_path: Path = REFERENCE_VOICE,
-    name: str = "femaleyoungeager",
-    speakers_dir: Path = SPEAKERS_DIR,
+    sample_path: Path | None = REFERENCE_VOICE,
+    name: str = VOICE_NAME,
 ) -> Path:
-    """Upload a reference voice and verify it landed in the speakers directory."""
-    stored_path = speakers_dir / sample_path.name
-    # Remove a previous copy so the check proves this upload stored the file.
-    stored_path.unlink(missing_ok=True)
+    """Create the voice ``name``; the sample is optional once the server stored it.
 
+    The server stores the sample as ``speakers/<name>.<ext>`` exactly once and
+    returns the stored file on every later request with the same ``name``.
+    """
     with httpx.Client(timeout=30.0) as client:
-        with open(sample_path, "rb") as sample:
-            response = client.post(
-                f"{BASE_URL}{VOICES_ENDPOINT}",
-                data={"name": name, "audio_type": "audio_sample"},
-                files={"audio_sample": (sample_path.name, sample, "audio/wav")},
-            )
+        data = {"name": name, "audio_type": "audio_sample"}
+        if sample_path is None:
+            response = client.post(f"{BASE_URL}{VOICES_ENDPOINT}", data=data)
+        else:
+            with open(sample_path, "rb") as sample:
+                response = client.post(
+                    f"{BASE_URL}{VOICES_ENDPOINT}",
+                    data=data,
+                    files={"audio_sample": (sample_path.name, sample, "audio/wav")},
+                )
 
     assert response.status_code == 200, (
         f"Voice upload failed: {response.status_code} {response.text}"
@@ -72,21 +74,27 @@ def upload_voice(
     body = response.json()
     assert body["object"] == "audio.voice", body
     assert body["name"] == name, body
-    #assert stored_path.is_file(), f"{stored_path} was not created by the upload"
-    #assert stored_path.read_bytes() == sample_path.read_bytes(), (
-    #    f"{stored_path} differs from the uploaded sample"
-    #)
-    print(f"Voice uploaded: {body['filepath']}")
+    stored_path = Path(body["filepath"])
+    assert stored_path.name == f"{name}.wav", body
+    assert stored_path.is_file(), f"{stored_path} was not stored by the server"
+    print(f"Voice available: {stored_path}")
     return stored_path
 
 
 def test_upload_voice():
-    upload_voice()
+    stored_path = upload_voice()
+    assert stored_path.read_bytes() == REFERENCE_VOICE.read_bytes()
+    stored_mtime = stored_path.stat().st_mtime_ns
+
+    # Repeating the request reuses the stored file, with or without a sample.
+    assert upload_voice() == stored_path
+    assert upload_voice(sample_path=None) == stored_path
+    assert stored_path.stat().st_mtime_ns == stored_mtime
 
 
 def send_tts_request(
     text: str,
-    ref_audio: Path = SPEAKERS_DIR / REFERENCE_VOICE.name,
+    ref_audio: Path,
     speaker_wav: str = None,
     language: str = "en",
     accent: str = None,

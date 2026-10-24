@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -1118,7 +1119,7 @@ class CreateVoicePromptRequest(BaseModel):
 class VoiceObject(BaseModel):
     """OpenAI ``Voice`` object, extended with the local sample ``filepath``."""
 
-    id: str
+    voice_id: str
     created_at: int
     name: str
     object: Literal["audio.voice"] = "audio.voice"
@@ -1191,8 +1192,6 @@ async def _read_voice_sample(upload: StarletteUploadFile) -> bytes:
                 status_code=413,
                 detail="audio_sample exceeds the maximum size of 10 MiB",
             )
-    if not data:
-        raise HTTPException(status_code=400, detail="audio_sample is empty")
     return bytes(data)
 
 
@@ -1259,34 +1258,156 @@ def _validation_error_detail(error: ValidationError) -> str:
     )
 
 
-def _write_voice_metadata(speakers_dir: Path, record: Dict[str, Any]) -> None:
-    metadata_path = speakers_dir / f"{record['id']}.json"
-    metadata_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^\w .-]+")
+
+
+def _voice_file_stem(name: str) -> str:
+    """Return the filesystem-safe file stem for a voice ``name``.
+
+    The voice name is the storage key, so clients can recreate a voice with
+    the same name and get the already stored file back.
+    """
+    stem = name.strip()
+    suffix = Path(stem).suffix.lower()
+    if suffix in ALLOWED_VOICE_SAMPLE_EXTENSIONS or suffix == ".json":
+        stem = stem[: -len(suffix)]
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", stem).strip(" ._")[:128]
+    if not stem:
+        raise HTTPException(
+            status_code=400,
+            detail=f"name {name!r} cannot be used as a voice file name",
+        )
+    return stem
+
+
+def _find_stored_voice_sample(speakers_dir: Path, stem: str) -> Optional[Path]:
+    for extension in sorted(ALLOWED_VOICE_SAMPLE_EXTENSIONS):
+        candidate = speakers_dir / f"{stem}{extension}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _sample_voice(filepath: Path, name: str) -> VoiceObject:
+    return VoiceObject(
+        voice_id=filepath.stem,
+        created_at=int(filepath.stat().st_mtime),
+        name=name,
+        type="audio_sample",
+        filepath=str(filepath),
+    )
+
+
+async def _create_sample_voice(
+    speakers_dir: Path,
+    params: CreateVoiceAudioSampleRequest,
+    upload: Optional[StarletteUploadFile],
+) -> VoiceObject:
+    """Store the sample as ``<name>.<ext>`` once; reuse it on later requests."""
+    stem = _voice_file_stem(params.name)
+    existing = _find_stored_voice_sample(speakers_dir, stem)
+    if existing is not None:
+        return _sample_voice(existing, params.name)
+
+    if upload is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"audio_sample is required: no stored voice named {stem!r}",
+        )
+    data = await _read_voice_sample(upload)
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"audio_sample is empty and no stored voice named {stem!r}",
+        )
+    extension = _resolve_voice_sample_extension(
+        upload.filename, upload.content_type, data[:64]
+    )
+    filepath = speakers_dir / f"{stem}{extension}"
+    try:
+        speakers_dir.mkdir(parents=True, exist_ok=True)
+        # Exclusive create: never overwrite a sample stored by a concurrent request.
+        with open(filepath, "xb") as buffer:
+            try:
+                buffer.write(data)
+            except OSError:
+                filepath.unlink(missing_ok=True)
+                raise
+    except FileExistsError:
+        pass
+    except OSError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to store audio sample: {e}"
+        )
+    return _sample_voice(filepath, params.name)
+
+
+def _create_prompt_voice(
+    speakers_dir: Path, params: CreateVoicePromptRequest
+) -> VoiceObject:
+    """Store the prompt as ``<name>.json`` once; reuse it on later requests."""
+    stem = _voice_file_stem(params.name)
+    filepath = speakers_dir / f"{stem}.json"
+    record = {
+        "id": stem,
+        "created_at": int(time.time()),
+        "name": params.name,
+        "object": "audio.voice",
+        "type": "prompt",
+        "prompt": params.prompt,
+        "model": params.model,
+        "script_hint": params.script_hint,
+    }
+    try:
+        speakers_dir.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "x", encoding="utf-8") as buffer:
+            json.dump(record, buffer, indent=2)
+    except FileExistsError:
+        try:
+            record = json.loads(filepath.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to read stored voice {stem!r}: {e}"
+            )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store voice: {e}")
+
+    return VoiceObject(
+        voice_id=stem,
+        created_at=int(record.get("created_at") or filepath.stat().st_mtime),
+        name=params.name,
+        type="prompt",
+        prompt=record.get("prompt") or params.prompt,
+    )
 
 
 @app.post("/v1/audio/voices", response_model_exclude_none=True)
 async def create_voice(request: Request) -> VoiceObject:
     """Create a custom voice following the OpenAI ``audio.voices.create`` API.
 
-    Two request variants are supported:
+    ``name`` is the voice's storage key in the speakers directory and its
+    returned ``id``. A voice is stored exactly once and never overwritten:
+    repeating a request with the same ``name`` returns the stored voice, so
+    the uploaded content is then optional and ignored.
 
     * ``type: "audio_sample"`` (default) as multipart/form-data with ``name``,
-      ``audio_sample`` (max 10 MiB) and ``consent``. The sample is stored in the
-      speakers directory and its ``filepath`` is returned so it can be passed
-      as ``ref_audio`` to ``/v1/audio/speech``. ``consent`` is accepted but not
-      verified.
+      ``audio_sample`` (max 10 MiB) and ``consent`` (accepted, not verified).
+      The sample is stored as ``<name>.<ext>``; its ``filepath`` can be passed
+      as ``ref_audio`` to ``/v1/audio/speech``.
     * ``type: "prompt"`` as JSON or form data with ``name``, ``prompt`` and the
-      optional ``model`` and ``script_hint``. The voice description is stored
-      and echoed back as ``prompt``; it can be used as ``instruct`` for
-      voice-design capable TTS models.
+      optional ``model`` and ``script_hint``, stored as ``<name>.json``. The
+      prompt can be used as ``instruct`` for voice-design capable TTS models.
 
-    Each voice's metadata is persisted as ``<voice_id>.json`` next to the sample.
+    For client compatibility, ``title`` is accepted for ``name`` and
+    ``audio_type`` for ``type``.
     """
     print("Creating voice...")
 
     fields, upload = await _parse_create_voice_body(request)
     if fields.get("title") is not None:
         fields["name"] = fields["title"]
+    if not fields.get("type") and fields.get("audio_type"):
+        fields["type"] = fields["audio_type"]
 
     voice_type = fields.get("type") or "audio_sample"
     try:
@@ -1309,60 +1430,10 @@ async def create_voice(request: Request) -> VoiceObject:
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=_validation_error_detail(e))
 
-    voice_id = f"voice_{uuid.uuid4().hex}"
-    created_at = int(time.time())
     speakers_dir = get_speakers_dir()
-
     if isinstance(params, CreateVoiceAudioSampleRequest):
-        if upload is None:
-            raise HTTPException(
-                status_code=400,
-                detail="audio_sample is required for type 'audio_sample'",
-            )
-        data = await _read_voice_sample(upload)
-        extension = _resolve_voice_sample_extension(
-            upload.filename, upload.content_type, data[:64]
-        )
-        filepath = speakers_dir / f"{voice_id}{extension}"
-        voice = VoiceObject(
-            id=voice_id,
-            created_at=created_at,
-            name=params.name,
-            type="audio_sample",
-            filepath=str(filepath),
-        )
-        metadata = {
-            **voice.model_dump(exclude_none=True),
-            "consent": params.consent,
-            "original_filename": upload.filename,
-            "content_type": upload.content_type,
-        }
-    else:
-        filepath = None
-        voice = VoiceObject(
-            id=voice_id,
-            created_at=created_at,
-            name=params.name,
-            type="prompt",
-            prompt=params.prompt,
-        )
-        metadata = {
-            **voice.model_dump(exclude_none=True),
-            "model": params.model,
-            "script_hint": params.script_hint,
-        }
-
-    try:
-        speakers_dir.mkdir(parents=True, exist_ok=True)
-        if filepath is not None:
-            filepath.write_bytes(data)
-        _write_voice_metadata(speakers_dir, metadata)
-    except OSError as e:
-        if filepath is not None:
-            filepath.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Failed to store voice: {e}")
-
-    return voice
+        return await _create_sample_voice(speakers_dir, params, upload)
+    return _create_prompt_voice(speakers_dir, params)
 
 
 @app.post("/v1/audio/transcriptions")

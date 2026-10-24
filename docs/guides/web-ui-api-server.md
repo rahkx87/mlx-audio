@@ -116,19 +116,19 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 **`POST /v1/audio/voices`**
 
-Compatible with the OpenAI `client.audio.voices.create(...)` API. Voices are stored in the `speakers/` directory (override with the `MLX_AUDIO_SPEAKERS_DIR` environment variable). Each voice also gets a `<voice_id>.json` metadata file there.
+Compatible with the OpenAI `client.audio.voices.create(...)` API. Voices are stored in the `speakers/` directory (override with the `MLX_AUDIO_SPEAKERS_DIR` environment variable). The voice `name` is the storage key and the returned `id`: each voice is stored exactly once and never overwritten, and repeating a request with the same `name` returns the stored voice. For client compatibility, `title` is accepted for `name` and `audio_type` for `type`.
 
 | Field | `type=audio_sample` (default) | `type=prompt` |
 |-------|-------------------------------|---------------|
 | `name` | required | required |
-| `audio_sample` | required file, max 10 MiB (`audio/mpeg`, `audio/wav`, `audio/x-wav`, `audio/ogg`, `audio/aac`, `audio/flac`, `audio/webm`, `audio/mp4`) | – |
+| `audio_sample` | file, max 10 MiB, required only if no voice with that `name` is stored yet (`audio/mpeg`, `audio/wav`, `audio/x-wav`, `audio/ogg`, `audio/aac`, `audio/flac`, `audio/webm`, `audio/mp4`) | – |
 | `consent` | consent recording ID (accepted, not verified) | – |
 | `prompt` | – | required, non-blank voice description |
 | `model` | – | optional, defaults to `auto` |
 | `script_hint` | – | optional, non-blank if provided |
 | Encoding | `multipart/form-data` | JSON, `multipart/form-data` or urlencoded form |
 
-Upload a reference audio sample. The response includes the saved `filepath`, which can be passed as `ref_audio` to `/v1/audio/speech`:
+Upload a reference audio sample. It is stored as `speakers/<name>.<ext>` (unsafe characters in `name` are replaced by `_`). Later requests with the same `name` reuse that file, so `audio_sample` can be omitted or sent empty. The response includes the `filepath`, which can be passed as `ref_audio` to `/v1/audio/speech`:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/voices \
@@ -139,16 +139,16 @@ curl -X POST http://localhost:8000/v1/audio/voices \
 
 ```json
 {
-  "id": "voice_3f2a...",
+  "id": "My new voice",
   "created_at": 1760385600,
   "name": "My new voice",
   "object": "audio.voice",
   "type": "audio_sample",
-  "filepath": "/path/to/speakers/voice_3f2a....wav"
+  "filepath": "/path/to/speakers/My new voice.wav"
 }
 ```
 
-Create a voice from a text description. The response includes `prompt` (no `filepath`). The description can be passed as `instruct` to voice-design capable TTS models:
+Create a voice from a text description, stored as `speakers/<name>.json`. The response includes `prompt` (no `filepath`). The description can be passed as `instruct` to voice-design capable TTS models:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/voices \
