@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -19,7 +20,7 @@ import webbrowser
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import unquote
 
 import mlx.core as mx
@@ -40,7 +41,8 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from huggingface_hub.errors import RepositoryNotFoundError
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from mlx_audio.audio_io import read as audio_read
 from mlx_audio.audio_io import write as audio_write
@@ -1033,6 +1035,9 @@ async def tts_voices(model: Optional[str] = None):
     }
 
 
+VOICE_SAMPLE_MAX_BYTES = 10 * 1024 * 1024
+VOICE_SAMPLE_READ_CHUNK = 1024 * 1024
+
 ALLOWED_VOICE_SAMPLE_EXTENSIONS = {
     ".wav",
     ".mp3",
@@ -1040,71 +1045,395 @@ ALLOWED_VOICE_SAMPLE_EXTENSIONS = {
     ".ogg",
     ".opus",
     ".m4a",
+    ".mp4",
     ".aac",
     ".webm",
 }
+
+# MIME types from the OpenAI spec plus common aliases sent by browsers/clients.
+VOICE_SAMPLE_MIME_EXTENSIONS = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/vnd.wave": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/aac": ".aac",
+    "audio/x-aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/webm": ".webm",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+}
+
+_GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
+
+
+class CreateVoiceAudioSampleRequest(BaseModel):
+    """``type: "audio_sample"`` variant of the OpenAI create-voice request."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["audio_sample"] = "audio_sample"
+    name: str
+    # Required by OpenAI; optional here because there is no consent store to verify against.
+    consent: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+
+class CreateVoicePromptRequest(BaseModel):
+    """``type: "prompt"`` variant of the OpenAI create-voice request."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["prompt"]
+    name: str
+    prompt: str
+    model: str = "auto"
+    script_hint: Optional[str] = None
+
+    @field_validator("name", "prompt")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty or whitespace only")
+        return value
+
+    @field_validator("script_hint")
+    @classmethod
+    def _script_hint_not_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank after trimming whitespace")
+        return value
+
+
+class VoiceObject(BaseModel):
+    """OpenAI ``Voice`` object, extended with the local sample ``filepath``."""
+
+    voice_id: str
+    created_at: int
+    name: str
+    object: Literal["audio.voice"] = "audio.voice"
+    type: Literal["audio_sample", "prompt"]
+    prompt: Optional[str] = None
+    filepath: Optional[str] = None
 
 
 def get_speakers_dir() -> Path:
     return Path(os.environ.get("MLX_AUDIO_SPEAKERS_DIR", "speakers")).resolve()
 
 
-@app.post("/v1/audio/voices")
-async def create_voice(
-    name: str = Form(...),
-    audio_sample: UploadFile = File(...),
-    consent: Optional[str] = Form(None),
-    type: str = Form("audio_sample"),
-):
-    """Create a custom voice by storing the uploaded audio sample.
+def _sniff_audio_extension(header: bytes) -> Optional[str]:
+    if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return ".wav"
+    if header[:4] == b"fLaC":
+        return ".flac"
+    if header[:4] == b"OggS":
+        return ".opus" if b"OpusHead" in header[:64] else ".ogg"
+    if header[:3] == b"ID3":
+        return ".mp3"
+    if header[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    if header[4:8] == b"ftyp":
+        return ".m4a"
+    if len(header) >= 2 and header[0] == 0xFF:
+        # ADTS AAC uses layer bits 00; MPEG audio (mp3) uses non-zero layer bits.
+        if header[1] & 0xF6 == 0xF0:
+            return ".aac"
+        if header[1] & 0xE0 == 0xE0:
+            return ".mp3"
+    return None
 
-    The sample is saved in the speakers directory and its path is returned
-    so it can be passed as ``ref_audio`` to ``/v1/audio/speech``.
-    ``consent`` is accepted for OpenAI API compatibility but not verified.
+
+def _resolve_voice_sample_extension(
+    filename: Optional[str], content_type: Optional[str], header: bytes
+) -> str:
+    """Pick a storage extension from the filename, MIME type, or file magic."""
+    extension = Path(filename or "").suffix.lower()
+    if extension in ALLOWED_VOICE_SAMPLE_EXTENSIONS:
+        return extension
+
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if mime in VOICE_SAMPLE_MIME_EXTENSIONS:
+        return VOICE_SAMPLE_MIME_EXTENSIONS[mime]
+
+    # Clients such as the OpenAI SDK send raw bytes without a filename/MIME type.
+    if mime in _GENERIC_MIME_TYPES and not extension:
+        sniffed = _sniff_audio_extension(header)
+        if sniffed:
+            return sniffed
+
+    supported = ", ".join(sorted(VOICE_SAMPLE_MIME_EXTENSIONS))
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unsupported audio_sample file type "
+            f"(filename={filename!r}, content_type={content_type!r}). "
+            f"Supported MIME types: {supported}"
+        ),
+    )
+
+
+async def _read_voice_sample(upload: StarletteUploadFile) -> bytes:
+    data = bytearray()
+    while chunk := await upload.read(VOICE_SAMPLE_READ_CHUNK):
+        data.extend(chunk)
+        if len(data) > VOICE_SAMPLE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="audio_sample exceeds the maximum size of 10 MiB",
+            )
+    return bytes(data)
+
+
+async def _parse_create_voice_body(
+    request: Request,
+) -> tuple[Dict[str, Any], Optional[StarletteUploadFile]]:
+    """Parse JSON, multipart or urlencoded bodies into fields + optional upload."""
+    content_type = request.headers.get("content-type", "")
+    print(content_type)
+    media_type = content_type.split(";")[0].strip().lower()
+    print(f"media_type={media_type}")
+
+    if media_type == "application/json" or media_type.endswith("+json"):
+        try:
+            body = await request.json()
+            print(f"Body: {body}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400, detail="Request body must be a JSON object"
+            )
+        if "audio_sample" in body:
+            raise HTTPException(
+                status_code=400,
+                detail="audio_sample must be uploaded as multipart/form-data",
+            )
+        return body, None
+
+    if media_type in ("multipart/form-data", "application/x-www-form-urlencoded"):
+        try:
+            form = await request.form()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid form body: {e}")
+        fields: Dict[str, Any] = {}
+        upload: Optional[StarletteUploadFile] = None
+        for key, value in form.multi_items():
+            if key == "audio_sample":
+                if not isinstance(value, StarletteUploadFile):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="audio_sample must be uploaded as a file",
+                    )
+                upload = value
+            elif isinstance(value, str):
+                fields[key] = value
+        print(f"Fields: {fields}")
+        print(f"Upload: {upload}")
+        return fields, upload
+
+    raise HTTPException(
+        status_code=415,
+        detail=(
+            "Unsupported Content-Type. Use multipart/form-data, "
+            "application/x-www-form-urlencoded or application/json."
+        ),
+    )
+
+
+def _validation_error_detail(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in err['loc']) or 'body'}: {err['msg']}"
+        for err in error.errors(include_url=False)
+    )
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^\w .-]+")
+
+
+def _voice_file_stem(name: str) -> str:
+    """Return the filesystem-safe file stem for a voice ``name``.
+
+    The voice name is the storage key, so clients can recreate a voice with
+    the same name and get the already stored file back.
     """
-    if type != "audio_sample":
+    stem = name.strip()
+    suffix = Path(stem).suffix.lower()
+    if suffix in ALLOWED_VOICE_SAMPLE_EXTENSIONS or suffix == ".json":
+        stem = stem[: -len(suffix)]
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", stem).strip(" ._")[:128]
+    if not stem:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported voice type: {type}. Only 'audio_sample' is supported.",
+            detail=f"name {name!r} cannot be used as a voice file name",
         )
-    if not name.strip():
-        raise HTTPException(status_code=400, detail="name must not be empty")
+    return stem
 
-    extension = Path(audio_sample.filename or "").suffix.lower() or ".wav"
-    if extension not in ALLOWED_VOICE_SAMPLE_EXTENSIONS:
+
+def _find_stored_voice_sample(speakers_dir: Path, stem: str) -> Optional[Path]:
+    for extension in sorted(ALLOWED_VOICE_SAMPLE_EXTENSIONS):
+        candidate = speakers_dir / f"{stem}{extension}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _sample_voice(filepath: Path, name: str) -> VoiceObject:
+    return VoiceObject(
+        voice_id=filepath.stem,
+        created_at=int(filepath.stat().st_mtime),
+        name=name,
+        type="audio_sample",
+        filepath=str(filepath),
+    )
+
+
+async def _create_sample_voice(
+    speakers_dir: Path,
+    params: CreateVoiceAudioSampleRequest,
+    upload: Optional[StarletteUploadFile],
+) -> VoiceObject:
+    """Store the sample as ``<name>.<ext>`` once; reuse it on later requests."""
+    stem = _voice_file_stem(params.name)
+    existing = _find_stored_voice_sample(speakers_dir, stem)
+    if existing is not None:
+        return _sample_voice(existing, params.name)
+
+    if upload is None:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Unsupported audio_sample file type: {extension}. Supported: "
-                f"{', '.join(sorted(ALLOWED_VOICE_SAMPLE_EXTENSIONS))}"
-            ),
+            detail=f"audio_sample is required: no stored voice named {stem!r}",
         )
-
-    data = await audio_sample.read()
+    data = await _read_voice_sample(upload)
     if not data:
-        raise HTTPException(status_code=400, detail="audio_sample is empty")
-
-    filename = Path(audio_sample.filename or "missing")
-    speakers_dir = get_speakers_dir()
-    filepath = speakers_dir.joinpath(filename)
-
+        raise HTTPException(
+            status_code=400,
+            detail=f"audio_sample is empty and no stored voice named {stem!r}",
+        )
+    extension = _resolve_voice_sample_extension(
+        upload.filename, upload.content_type, data[:64]
+    )
+    filepath = speakers_dir / f"{stem}{extension}"
     try:
-        if not os.path.exists(filepath):
-            with open(filepath, "wb") as buffer:
+        speakers_dir.mkdir(parents=True, exist_ok=True)
+        # Exclusive create: never overwrite a sample stored by a concurrent request.
+        with open(filepath, "xb") as buffer:
+            try:
                 buffer.write(data)
+            except OSError:
+                filepath.unlink(missing_ok=True)
+                raise
+    except FileExistsError:
+        pass
     except OSError as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to store audio sample: {e}"
         )
+    return _sample_voice(filepath, params.name)
 
-    return {
-        "id": name,
+
+def _create_prompt_voice(
+    speakers_dir: Path, params: CreateVoicePromptRequest
+) -> VoiceObject:
+    """Store the prompt as ``<name>.json`` once; reuse it on later requests."""
+    stem = _voice_file_stem(params.name)
+    filepath = speakers_dir / f"{stem}.json"
+    record = {
+        "id": stem,
         "created_at": int(time.time()),
-        "name": name,
+        "name": params.name,
         "object": "audio.voice",
-        "type": "audio_sample",
-        "filepath": str(filepath),
+        "type": "prompt",
+        "prompt": params.prompt,
+        "model": params.model,
+        "script_hint": params.script_hint,
     }
+    try:
+        speakers_dir.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "x", encoding="utf-8") as buffer:
+            json.dump(record, buffer, indent=2)
+    except FileExistsError:
+        try:
+            record = json.loads(filepath.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to read stored voice {stem!r}: {e}"
+            )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store voice: {e}")
+
+    return VoiceObject(
+        voice_id=stem,
+        created_at=int(record.get("created_at") or filepath.stat().st_mtime),
+        name=params.name,
+        type="prompt",
+        prompt=record.get("prompt") or params.prompt,
+    )
+
+
+@app.post("/v1/audio/voices", response_model_exclude_none=True)
+async def create_voice(request: Request) -> VoiceObject:
+    """Create a custom voice following the OpenAI ``audio.voices.create`` API.
+
+    ``name`` is the voice's storage key in the speakers directory and its
+    returned ``id``. A voice is stored exactly once and never overwritten:
+    repeating a request with the same ``name`` returns the stored voice, so
+    the uploaded content is then optional and ignored.
+
+    * ``type: "audio_sample"`` (default) as multipart/form-data with ``name``,
+      ``audio_sample`` (max 10 MiB) and ``consent`` (accepted, not verified).
+      The sample is stored as ``<name>.<ext>``; its ``filepath`` can be passed
+      as ``ref_audio`` to ``/v1/audio/speech``.
+    * ``type: "prompt"`` as JSON or form data with ``name``, ``prompt`` and the
+      optional ``model`` and ``script_hint``, stored as ``<name>.json``. The
+      prompt can be used as ``instruct`` for voice-design capable TTS models.
+
+    For client compatibility, ``title`` is accepted for ``name`` and
+    ``audio_type`` for ``type``.
+    """
+    print("Creating voice...")
+
+    fields, upload = await _parse_create_voice_body(request)
+    if fields.get("title") is not None:
+        fields["name"] = fields["title"]
+    if not fields.get("type") and fields.get("audio_type"):
+        fields["type"] = fields["audio_type"]
+
+    voice_type = fields.get("type") or "audio_sample"
+    try:
+        if voice_type == "audio_sample":
+            params: CreateVoiceAudioSampleRequest | CreateVoicePromptRequest = (
+                CreateVoiceAudioSampleRequest.model_validate(
+                    {**fields, "type": voice_type}
+                )
+            )
+        elif voice_type == "prompt":
+            params = CreateVoicePromptRequest.model_validate(fields)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported voice type: {voice_type}. "
+                    "Expected 'audio_sample' or 'prompt'."
+                ),
+            )
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=_validation_error_detail(e))
+
+    speakers_dir = get_speakers_dir()
+    if isinstance(params, CreateVoiceAudioSampleRequest):
+        return await _create_sample_voice(speakers_dir, params, upload)
+    return _create_prompt_voice(speakers_dir, params)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -2139,7 +2468,7 @@ def main():
         help="List of allowed origins for CORS",
     )
     parser.add_argument(
-        "--host", type=str, default="localhost", help="Host to run the server on"
+        "--host", type=str, default="0.0.0.0", help="Host to run the server on"
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="Port to run the server on"
