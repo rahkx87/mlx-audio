@@ -30,7 +30,7 @@ dependencies = [
     "sounddevice>=0.5.3",
     "torch>=2.14.1",
     "tqdm>=4.67.1",
-    "transformers>=5.14.0",
+    "transformers[chat-template]>=5.14.0",
 ]
 
 [project.optional-dependencies]
