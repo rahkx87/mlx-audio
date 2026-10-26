@@ -19,13 +19,13 @@ from .config import AudioEncoderConfig, ModelConfig, TextConfig
 
 @dataclass
 class StreamingResult:
-    """Result object for streaming transcription.
+    """Text-delta or chunk-boundary event from streaming transcription.
 
     Attributes:
         text: Decoded text for this emission.
         is_final: True if this is a final (committed) result, False if partial.
-        start_time: Start timestamp in seconds.
-        end_time: End timestamp in seconds.
+        start_time: Chunk start in seconds, or None for a text delta.
+        end_time: Chunk end in seconds, or None for a text delta.
         language: Language of the transcription.
         prompt_tokens: Total prompt tokens (only set on final result).
         generation_tokens: Total generation tokens (only set on final result).
@@ -33,11 +33,26 @@ class StreamingResult:
 
     text: str
     is_final: bool
-    start_time: float
-    end_time: float
+    start_time: Optional[float]
+    end_time: Optional[float]
     language: str = "en"
     prompt_tokens: int = 0
     generation_tokens: int = 0
+
+
+def _validate_audio(wav: np.ndarray) -> None:
+    if wav.size == 0:
+        raise ValueError("Audio input must contain at least one sample")
+    if not np.isfinite(wav).all():
+        raise ValueError("Audio input must contain only finite samples")
+
+
+def _audio_duration(wav: np.ndarray, sr: int) -> float:
+    """Return the duration before model-only padding is applied."""
+    _validate_audio(wav)
+    if wav.ndim > 1 and wav.shape[-1] > 2:
+        return wav.shape[-1] / sr
+    return len(wav) / sr
 
 
 def split_audio_into_chunks(
@@ -876,12 +891,18 @@ class Qwen3ASRModel(nn.Module):
         """Preprocess audio for the model."""
         from mlx_audio.stt.utils import load_audio
 
+        audio_input = audio[0] if isinstance(audio, list) else audio
+
         if isinstance(audio, list):
             raise ValueError("Audio preprocessing expects one input")
-        if isinstance(audio, str):
-            audio = load_audio(audio)
 
-        audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
+        if isinstance(audio_input, str):
+            audio_input = load_audio(audio_input)
+
+        audio_np = (
+            np.array(audio_input) if isinstance(audio_input, mx.array) else audio_input
+        )
+        _validate_audio(audio_np)
 
         audio_inputs = self._feature_extractor(
             audio_np,
@@ -903,13 +924,18 @@ class Qwen3ASRModel(nn.Module):
     def extract_language(
         self,
         text: str,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """Extract language from text."""
-        if "<asr_text>" in text and text.startswith("language "):
-            return (
-                text[len("language ") : text.find("<asr_text>")].strip(),
-                text[text.find("<asr_text>") + len("<asr_text>") :],
-            )
+        stripped_text = text.strip()
+        if "<asr_text>" in stripped_text:
+            metadata, transcript = stripped_text.split("<asr_text>", 1)
+            for line in metadata.splitlines():
+                line = line.strip()
+                if line.lower().startswith("language "):
+                    language = line[len("language ") :].strip()
+                    if language.lower() == "none":
+                        return "", transcript.strip()
+                    return language, transcript.strip()
         return "English", text
 
     def _build_prompt(
@@ -1140,7 +1166,7 @@ class Qwen3ASRModel(nn.Module):
                 input_ids = self._build_prompt(n_audio, language, system_prompt)
                 embeds.append(self._build_inputs_embeds(input_ids, af)[0])
                 if token_histories is not None:
-                    token_histories.append(input_ids[0, -1:])
+                    token_histories.append(input_ids[0])
 
             x = mx.stack(embeds, axis=0)  # (B, L, H), equal L
             bsz = x.shape[0]
@@ -1395,9 +1421,13 @@ class Qwen3ASRModel(nn.Module):
             )
 
         # Load audio
-        if isinstance(audio, str):
-            audio = load_audio(audio)
-        audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
+        audio_input = audio[0] if isinstance(audio, list) else audio
+        if isinstance(audio_input, str):
+            audio_input = load_audio(audio_input)
+        audio_np = (
+            np.array(audio_input) if isinstance(audio_input, mx.array) else audio_input
+        )
+        total_duration = _audio_duration(audio_np, self.sample_rate)
 
         # Split into chunks if needed
         chunks = split_audio_into_chunks(
@@ -1406,6 +1436,7 @@ class Qwen3ASRModel(nn.Module):
             chunk_duration=chunk_duration,
             min_chunk_duration=min_chunk_duration,
         )
+        chunk_end_times = [offset for _, offset in chunks[1:]] + [total_duration]
 
         sampler = make_sampler(
             temperature,
@@ -1442,35 +1473,51 @@ class Qwen3ASRModel(nn.Module):
                 batch_size=batch_size,
                 verbose=verbose,
             )
-            for (chunk_audio, offset_sec), text, gt, pt, was_processed in zip(
-                chunks, texts, gen_toks, prompt_toks, processed
-            ):
+            for (
+                (chunk_audio, offset_sec),
+                chunk_end,
+                text,
+                gt,
+                pt,
+                was_processed,
+            ) in zip(chunks, chunk_end_times, texts, gen_toks, prompt_toks, processed):
                 if not was_processed:
                     continue
+                chunk_language = language
                 if language is None:
-                    language, text = self.extract_language(text)
+                    chunk_language, text = self.extract_language(text)
                 all_texts.append(text)
                 total_prompt_tokens += pt
                 total_generation_tokens += gt
                 segments.append(
                     {
                         "text": text,
-                        "language": language,
+                        "language": chunk_language,
                         "start": offset_sec,
-                        "end": offset_sec + len(chunk_audio) / self.sample_rate,
+                        "end": offset_sec
+                        + min(
+                            len(chunk_audio) / self.sample_rate,
+                            max(total_duration - offset_sec, 0.0),
+                        ),
                     }
                 )
             chunks = []  # skip the sequential loop below
 
         chunk_iter = tqdm(
-            chunks, desc="Processing chunks", disable=not verbose or len(chunks) == 1
+            zip(chunks, chunk_end_times),
+            total=len(chunks),
+            desc="Processing chunks",
+            disable=not verbose or len(chunks) == 1,
         )
-        for chunk_audio, offset_sec in chunk_iter:
+        for (chunk_audio, offset_sec), chunk_end in chunk_iter:
             # Stop if we've exhausted the token budget
             if remaining_tokens <= 0:
                 break
 
-            actual_chunk_duration = len(chunk_audio) / self.sample_rate
+            actual_chunk_duration = min(
+                len(chunk_audio) / self.sample_rate,
+                max(total_duration - offset_sec, 0.0),
+            )
 
             text, prompt_toks, gen_toks = self._generate_single_chunk(
                 chunk_audio,
@@ -1484,8 +1531,11 @@ class Qwen3ASRModel(nn.Module):
                 system_prompt=system_prompt,
             )
 
+            # Detect per chunk; the request's language must stay unset so that
+            # later chunks are auto-detected too.
+            chunk_language = language
             if language is None:
-                language, text = self.extract_language(text)
+                chunk_language, text = self.extract_language(text)
 
             all_texts.append(text)
             total_prompt_tokens += prompt_toks
@@ -1496,9 +1546,9 @@ class Qwen3ASRModel(nn.Module):
             segments.append(
                 {
                     "text": text,
-                    "language": language,
+                    "language": chunk_language,
                     "start": offset_sec,
-                    "end": offset_sec + actual_chunk_duration,
+                    "end": chunk_end,
                 }
             )
 
@@ -1508,7 +1558,7 @@ class Qwen3ASRModel(nn.Module):
         end_time = time.time()
 
         # Combine transcriptions
-        full_text = " ".join(all_texts)
+        full_text = " ".join(text for text in all_texts if text).strip()
 
         return STTOutput(
             text=full_text,
@@ -1557,6 +1607,7 @@ class Qwen3ASRModel(nn.Module):
         Yields:
             StreamingResult objects with text, timing, and status information.
         """
+        from mlx_audio.lm.generate import StreamingDetokenizer
         from mlx_audio.lm.sample_utils import make_logits_processors, make_sampler
         from mlx_audio.stt.utils import load_audio
 
@@ -1572,8 +1623,8 @@ class Qwen3ASRModel(nn.Module):
             audio = load_audio(audio)
         audio_np = np.array(audio) if isinstance(audio, mx.array) else audio
 
-        # Calculate total audio duration
-        total_duration = len(audio_np) / self.sample_rate
+        # Calculate duration before short inputs are padded for the model.
+        total_duration = _audio_duration(audio_np, self.sample_rate)
 
         # Split into chunks if needed
         chunks = split_audio_into_chunks(
@@ -1582,6 +1633,7 @@ class Qwen3ASRModel(nn.Module):
             chunk_duration=chunk_duration,
             min_chunk_duration=min_chunk_duration,
         )
+        chunk_end_times = [offset for _, offset in chunks[1:]] + [total_duration]
 
         sampler = make_sampler(
             temperature,
@@ -1605,8 +1657,6 @@ class Qwen3ASRModel(nn.Module):
         total_generation_tokens = 0
         remaining_tokens = max_tokens
 
-        language_accumulator = ""
-
         # Process each chunk and stream tokens
         chunk_iter = tqdm(
             enumerate(chunks),
@@ -1615,9 +1665,19 @@ class Qwen3ASRModel(nn.Module):
             disable=not verbose or len(chunks) == 1,
         )
         for chunk_idx, (chunk_audio, offset_sec) in chunk_iter:
-            actual_chunk_duration = len(chunk_audio) / self.sample_rate
+            actual_chunk_duration = min(
+                len(chunk_audio) / self.sample_rate,
+                max(total_duration - offset_sec, 0.0),
+            )
             is_last_chunk = chunk_idx == len(chunks) - 1
             token_count = 0
+            emitted_token_count = 0
+            language_tokens = []
+            detokenizer = StreamingDetokenizer(self._tokenizer)
+            # Detect per chunk; the request's language must stay unset so that
+            # later chunks are auto-detected too.
+            chunk_language = language
+            language_accumulator = ""
 
             # Get prompt tokens for this chunk
             _, _, num_audio_tokens = self._preprocess_audio(chunk_audio)
@@ -1637,18 +1697,24 @@ class Qwen3ASRModel(nn.Module):
                     system_prompt=system_prompt,
                 )
             ):
-                text = self._tokenizer.decode([int(token)])
+                token = int(token)
 
                 if language is None and i <= 2:
-                    language_accumulator += text
+                    language_tokens.append(token)
+                    language_accumulator = self._tokenizer.decode(language_tokens)
                     if "<asr_text>" in language_accumulator:
-                        language, _ = self.extract_language(language_accumulator)
+                        chunk_language, _ = self.extract_language(language_accumulator)
                     continue
 
                 # Estimate timing based on token position within chunk
                 # This is approximate since we don't have word-level alignment
-                prev_progress = token_count / max(remaining_tokens, 1)
                 token_count += 1
+                detokenizer.add_token(token)
+                text = detokenizer.last_segment
+                if not text:
+                    continue
+
+                prev_progress = emitted_token_count / max(remaining_tokens, 1)
                 curr_progress = min(token_count / max(remaining_tokens, 1), 1.0)
 
                 estimated_start = offset_sec + (actual_chunk_duration * prev_progress)
@@ -1659,6 +1725,19 @@ class Qwen3ASRModel(nn.Module):
                     is_final=False,
                     start_time=estimated_start,
                     end_time=estimated_end,
+                    language=chunk_language,
+                )
+                emitted_token_count = token_count
+
+            detokenizer.finalize()
+            if text := detokenizer.last_segment:
+                prev_progress = emitted_token_count / max(remaining_tokens, 1)
+                curr_progress = min(token_count / max(remaining_tokens, 1), 1.0)
+                yield StreamingResult(
+                    text=text,
+                    is_final=False,
+                    start_time=offset_sec + actual_chunk_duration * prev_progress,
+                    end_time=offset_sec + actual_chunk_duration * curr_progress,
                     language=language,
                 )
 
@@ -1672,7 +1751,7 @@ class Qwen3ASRModel(nn.Module):
                 is_final=is_last_chunk or remaining_tokens <= 0,
                 start_time=offset_sec,
                 end_time=offset_sec + actual_chunk_duration,
-                language=language,
+                language=chunk_language,
                 prompt_tokens=total_prompt_tokens,
                 generation_tokens=total_generation_tokens,
             )
