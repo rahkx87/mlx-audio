@@ -994,6 +994,58 @@ def test_stt_prompt_dropped_for_models_without_prompt(client, mock_model_provide
     assert "prompt" not in captured_kwargs
 
 
+def test_stt_prompt_passed_to_generate(client, mock_model_provider):
+    """prompt form field reaches generate() for prompt-driven STT models (e.g. MOSS-Music)."""
+    captured_kwargs: dict = {}
+
+    def mock_generate(path, prompt=None, **kwargs):
+        captured_kwargs["prompt"] = prompt
+        return {"text": "C major"}
+
+    mock_stt_model = MagicMock()
+    mock_stt_model.generate = mock_generate
+    mock_model_provider.load_model = MagicMock(return_value=mock_stt_model)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("test.mp3", _make_transcription_audio_buffer(), "audio/mp3")},
+        data={
+            "model": "test_stt_model",
+            "response_format": "json",
+            "prompt": "What is the key of this music?",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured_kwargs["prompt"] == "What is the key of this music?"
+
+
+def test_stt_prompt_dropped_for_models_without_prompt(client, mock_model_provider):
+    """Models whose generate() does not declare prompt never receive it."""
+    captured_kwargs: dict = {}
+
+    def mock_generate(path, language=None, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {"text": "hello"}
+
+    mock_stt_model = MagicMock()
+    mock_stt_model.generate = mock_generate
+    mock_model_provider.load_model = MagicMock(return_value=mock_stt_model)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("test.mp3", _make_transcription_audio_buffer(), "audio/mp3")},
+        data={
+            "model": "test_stt_model",
+            "response_format": "json",
+            "prompt": "ignored",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "prompt" not in captured_kwargs
+
+
 def test_stt_word_timestamps_verbose_json_words_passthrough(
     client, mock_model_provider
 ):
@@ -1635,3 +1687,107 @@ def test_tts_speech_streaming_uses_generate_config(client, mock_model_provider):
         "top_k": 50,
         "repetition_penalty": 1.05,
     }
+
+# ── Sampling defaults: omitted fields use the model's generation config ──
+
+QWEN_GENERATE_CONFIG = {
+    "temperature": 0.9,
+    "top_p": 1.0,
+    "top_k": 50,
+    "repetition_penalty": 1.05,
+    "max_new_tokens": 8192,
+}
+SERVER_SAMPLING_DEFAULTS = {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 40,
+    "repetition_penalty": 1.0,
+}
+
+
+def _sampling_kwargs(kwargs):
+    return {name: kwargs[name] for name in SERVER_SAMPLING_DEFAULTS}
+
+
+def _tts_model_with_config(generate_config):
+    model = MagicMock()
+    model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    model.generate_config = generate_config
+    return model
+
+
+def test_tts_speech_omitted_sampling_uses_model_generate_config(
+    client, mock_model_provider
+):
+    model = _tts_model_with_config(dict(QWEN_GENERATE_CONFIG))
+    mock_model_provider.load_model = MagicMock(return_value=model)
+
+    payload = {"model": "qwen3_tts", "input": "Hello", "voice": "vivian"}
+    response = client.post("/v1/audio/speech", json=payload)
+
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert _sampling_kwargs(kwargs) == {
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repetition_penalty": 1.05,
+    }
+    # Only the four sampling fields are resolved from the config.
+    assert kwargs["max_tokens"] == 1200
+
+
+@pytest.mark.parametrize(
+    "sent, expected",
+    [
+        (
+            {"temperature": 0, "top_p": 0, "top_k": 0, "repetition_penalty": 1.0},
+            {"temperature": 0, "top_p": 0, "top_k": 0, "repetition_penalty": 1.0},
+        ),
+        (
+            {"top_k": 0},
+            {"temperature": 0.9, "top_p": 1.0, "top_k": 0, "repetition_penalty": 1.05},
+        ),
+        (
+            {"temperature": 0.7, "repetition_penalty": 1.2},
+            {"temperature": 0.7, "top_p": 1.0, "top_k": 50, "repetition_penalty": 1.2},
+        ),
+    ],
+)
+def test_tts_speech_sent_sampling_overrides_generate_config(
+    client, mock_model_provider, sent, expected
+):
+    model = _tts_model_with_config(dict(QWEN_GENERATE_CONFIG))
+    mock_model_provider.load_model = MagicMock(return_value=model)
+
+    payload = {"model": "qwen3_tts", "input": "Hello", **sent}
+    response = client.post("/v1/audio/speech", json=payload)
+
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert _sampling_kwargs(kwargs) == expected
+
+
+@pytest.mark.parametrize("generate_config", ["missing", None, {}, {"top_k": None}])
+def test_tts_speech_without_generate_config_keeps_server_defaults(
+    client, mock_model_provider, generate_config
+):
+    if generate_config == "missing":
+        # spec= stops MagicMock from fabricating a generate_config attribute.
+        model = MagicMock(spec=["generate"])
+    else:
+        model = MagicMock()
+        model.generate_config = generate_config
+    model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=model)
+
+    response = client.post(
+        "/v1/audio/speech", json={"model": "other_tts", "input": "Hello"}
+    )
+
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert _sampling_kwargs(kwargs) == SERVER_SAMPLING_DEFAULTS
+
+
+

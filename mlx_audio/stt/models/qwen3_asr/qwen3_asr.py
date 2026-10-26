@@ -1436,6 +1436,7 @@ class Qwen3ASRModel(nn.Module):
             chunk_duration=chunk_duration,
             min_chunk_duration=min_chunk_duration,
         )
+        chunk_end_times = [offset for _, offset in chunks[1:]] + [total_duration]
 
         sampler = make_sampler(
             temperature,
@@ -1472,9 +1473,14 @@ class Qwen3ASRModel(nn.Module):
                 batch_size=batch_size,
                 verbose=verbose,
             )
-            for (chunk_audio, offset_sec), text, gt, pt, was_processed in zip(
-                chunks, texts, gen_toks, prompt_toks, processed
-            ):
+            for (
+                (chunk_audio, offset_sec),
+                chunk_end,
+                text,
+                gt,
+                pt,
+                was_processed,
+            ) in zip(chunks, chunk_end_times, texts, gen_toks, prompt_toks, processed):
                 if not was_processed:
                     continue
                 chunk_language = language
@@ -1498,9 +1504,12 @@ class Qwen3ASRModel(nn.Module):
             chunks = []  # skip the sequential loop below
 
         chunk_iter = tqdm(
-            chunks, desc="Processing chunks", disable=not verbose or len(chunks) == 1
+            zip(chunks, chunk_end_times),
+            total=len(chunks),
+            desc="Processing chunks",
+            disable=not verbose or len(chunks) == 1,
         )
-        for chunk_audio, offset_sec in chunk_iter:
+        for (chunk_audio, offset_sec), chunk_end in chunk_iter:
             # Stop if we've exhausted the token budget
             if remaining_tokens <= 0:
                 break
@@ -1539,7 +1548,7 @@ class Qwen3ASRModel(nn.Module):
                     "text": text,
                     "language": chunk_language,
                     "start": offset_sec,
-                    "end": offset_sec + actual_chunk_duration,
+                    "end": chunk_end,
                 }
             )
 
@@ -1624,6 +1633,7 @@ class Qwen3ASRModel(nn.Module):
             chunk_duration=chunk_duration,
             min_chunk_duration=min_chunk_duration,
         )
+        chunk_end_times = [offset for _, offset in chunks[1:]] + [total_duration]
 
         sampler = make_sampler(
             temperature,
