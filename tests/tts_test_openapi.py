@@ -48,8 +48,8 @@ def _extract_filename(headers, default="output.wav"):
 
 
 def upload_voice(
-    sample_path: Path | None = REFERENCE_VOICE,
-    name: str = VOICE_NAME,
+        sample_path: Path | None = REFERENCE_VOICE,
+        name: str = VOICE_NAME,
 ) -> Path:
     """Create the voice ``name``; the sample is optional once the server stored it.
 
@@ -93,18 +93,18 @@ def test_upload_voice():
 
 
 def send_tts_request(
-    text: str,
-    ref_audio: Path,
-    speaker_wav: str = None,
-    language: str = "en",
-    accent: str = None,
-    save_path: str = None,
-    temperature: float = None,
-    top_p: float = None,
-    top_k: int = None,
-    speed: float = None,
-    repetition_penalty: float = None,
-    override: bool = False,
+        text: str,
+        ref_audio: Path,
+        speaker_wav: str = None,
+        language: str = "en",
+        accent: str = None,
+        save_path: str = None,
+        temperature: float = None,
+        top_p: float = None,
+        top_k: int = None,
+        speed: float = None,
+        repetition_penalty: float = None,
+        override: bool = False,
 ):
     payload = {
         "text": text,

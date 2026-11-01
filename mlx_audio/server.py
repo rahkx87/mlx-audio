@@ -1141,6 +1141,7 @@ class VoiceObject(BaseModel):
     type: Literal["audio_sample", "prompt"]
     prompt: Optional[str] = None
     filepath: Optional[str] = None
+    id: Optional[str] = None
 
 
 def get_speakers_dir() -> Path:
@@ -1310,6 +1311,7 @@ def _sample_voice(filepath: Path, name: str) -> VoiceObject:
         name=name,
         type="audio_sample",
         filepath=str(filepath),
+        id=filepath.stem,
     )
 
 
@@ -1393,6 +1395,7 @@ def _create_prompt_voice(
         name=params.name,
         type="prompt",
         prompt=record.get("prompt") or params.prompt,
+        id=stem,
     )
 
 
