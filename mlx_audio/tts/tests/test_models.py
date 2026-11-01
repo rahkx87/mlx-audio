@@ -170,6 +170,7 @@ class TestKokoroModel(unittest.TestCase):
                 "dropout": 0.1,
             },
             "vocab": {"a": 1, "b": 2},
+            "model_path": "/mock/model",
         }
         mock_json_load.return_value = config
 
@@ -185,6 +186,7 @@ class TestKokoroModel(unittest.TestCase):
         # Check that the model was initialized correctly
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(model.vocab, {"a": 1, "b": 2})
+        self.assertEqual(model.config.model_path, "/mock/model")
 
     def test_output_dataclass(self):
         """Test KokoroModel.Output dataclass."""
@@ -319,6 +321,7 @@ class TestKokoroPipeline(unittest.TestCase):
                     pipeline.voices = {}
                     # Add the missing repo_id attribute
                     pipeline.repo_id = "mlx-community/kokoro-tts"
+                    pipeline.model_path = None
 
                     # Mock the load voice return value
                     load_voice_tensor.return_value = mx.zeros((512, 1, 256))
@@ -1280,6 +1283,39 @@ class TestIndexTTS(unittest.TestCase):
 
         # Check that model was created
         self.assertIsInstance(model, Model)
+
+    def test_prompt_ends_with_start_mel_at_mel_position_zero(self):
+        """The start mel token opens the mel sequence, as in the reference GPT2InferenceModel."""
+        from mlx_audio.tts.models.indextts.indextts import Model
+
+        model = Model(self._default_config)  # type: ignore
+        n_mels = model.args.gpt.condition_module.input_size
+        embedding = model.prepare_input_embedding(
+            ["hello"], None, ref_mel=mx.zeros((1, 20, n_mels))
+        )
+        start = mx.array([[model.args.gpt.start_mel_token]])
+        expected = model.mel_embedding(start) + model.mel_pos_embedding(start)
+        self.assertTrue(mx.allclose(embedding[:, -1:, :], expected).item())
+
+    def test_tokenizer_defaults_to_model_path(self):
+        """Converted checkpoints have no tokenizer_name; the loaded directory is used."""
+        from pathlib import Path
+
+        from mlx_audio.tts.models.indextts import indextts
+
+        config = dict(self._default_config)
+        del config["tokenizer_name"]
+        config["model_path"] = "/models/IndexTTS"
+        with (
+            patch.object(
+                indextts.huggingface_hub, "hf_hub_download", side_effect=ValueError
+            ),
+            patch.object(indextts.spm, "SentencePieceProcessor") as processor,
+        ):
+            indextts.Model(config)  # type: ignore
+        processor.assert_called_once_with(
+            model_file=str(Path("/models/IndexTTS/tokenizer.model").resolve())
+        )
 
 
 class TestVibeVoiceModel(unittest.TestCase):
@@ -2300,6 +2336,18 @@ class TestSoprano(unittest.TestCase):
         self.assertIn("hundred", normalize_numbers("100"))
         self.assertIn("dollar", normalize_numbers("$5"))
         self.assertIn("first", normalize_numbers("1st"))
+
+    def test_ordinals(self):
+        from mlx_audio.tts.models.soprano.text import normalize_numbers
+
+        self.assertEqual(normalize_numbers("July 4th"), "July fourth")
+        self.assertEqual(normalize_numbers("the 20th century"), "the twentieth century")
+        self.assertEqual(normalize_numbers("101st"), "one hundred first")
+        self.assertEqual(normalize_numbers("112th"), "one hundred twelfth")
+        self.assertEqual(normalize_numbers("100th"), "one hundredth")
+        self.assertEqual(normalize_numbers("1001st"), "one thousand first")
+        self.assertEqual(normalize_numbers("10K"), "ten thousand")
+        self.assertEqual(normalize_numbers("25M"), "twenty five million")
 
     def test_expand_abbreviations(self):
         """Test abbreviation expansion."""
@@ -3394,7 +3442,16 @@ class TestQwen3TTSGenerateICL(unittest.TestCase):
             )
 
         self.assertEqual(len(results), 51)
-        self.assertEqual(model.speech_tokenizer.decoder.streaming_step.call_count, 51)
+        decoder_calls = model.speech_tokenizer.decoder.streaming_step.call_args_list
+        # One reference-priming call precedes the 51 generated audio chunks.
+        self.assertEqual(len(decoder_calls), 52)
+        np.testing.assert_array_equal(
+            np.array(decoder_calls[0].args[0]),
+            np.array(model.speech_tokenizer.encode.return_value),
+        )
+        for decoder_call in decoder_calls[1:]:
+            self.assertEqual(decoder_call.args[0].shape, (1, 4, 1))
+        self.assertEqual(sum(result.samples for result in results), 51 * 1920)
         mock_clear_cache.assert_called_once_with()
 
     def test_generate_icl_repetition_penalty_applied(self):
@@ -3913,6 +3970,8 @@ class TestBailingMMModel(unittest.TestCase):
         model.tokenizer.encode.return_value = [1, 2, 3]
         model.audio = MagicMock()
         model.audio.sample_rate = 24000
+        model.chat_layout = False
+        model.ming3 = False
         return model
 
     def test_convert_campplus_onnx_to_safetensors_allclose(self):
@@ -4021,6 +4080,13 @@ class TestBailingMMModel(unittest.TestCase):
         mock_qwen2_lm.assert_called_once()
         mock_moe_lm.assert_not_called()
         self.assertEqual(model.llm_args.model_type, "qwen2")
+        self.assertEqual(model.generate_config["temperature"], 0.0)
+        self.assertFalse(_mock_flowloss.call_args.kwargs["ming3_sampling"])
+
+        config["ditar_config"] = {"patch_size": 1, "history_patch_size": 1}
+        model = Model(config)
+        self.assertTrue(model.ming3)
+        self.assertTrue(_mock_flowloss.call_args.kwargs["ming3_sampling"])
 
     @patch(
         "mlx_audio.tts.models.bailingmm.bailingmm.mx.get_peak_memory",
@@ -4038,7 +4104,7 @@ class TestBailingMMModel(unittest.TestCase):
         latent = mx.zeros((1, 1, 64), dtype=mx.float32)
         model.sample = MagicMock(return_value=iter([(latent, True)]))
 
-        # Torch path does not apply a trailing low-energy trim pass.
+        # Ming Omni decoding keeps trailing samples.
         chunk = mx.array([[0.25, 0.15, 0.0, 0.0, 0.0]], dtype=mx.float32)
         model.audio.decode.return_value = (chunk, (None, None, None), None)
 
@@ -5513,6 +5579,74 @@ class TestIrodoriV3VoiceDesignGenerate(unittest.TestCase):
         self.assertGreater(results[0].samples, 0)
 
 
+class TestIrodoriSpeakerKVScaleRollback(unittest.TestCase):
+    """speaker_kv_scale is rolled back once t crosses speaker_kv_min_t.
+
+    With dual conditioning and independent CFG, the CFG batch holds one bundle
+    per active guidance term (up to 4), and the rolled-back speaker KV cache must
+    keep that batch size.
+    """
+
+    def _make_model(self):
+        from mlx_audio.tts.models.irodori_tts.irodori_tts import Model
+
+        cfg = _small_irodori_model_config_v3_voicedesign(
+            num_steps=4,
+            cfg_scale_text=3.0,
+            cfg_scale_speaker=5.0,
+            cfg_scale_caption=3.0,
+            cfg_guidance_mode="independent",
+            cfg_min_t=0.0,
+            t_schedule_mode="linear",
+        )
+        model = Model(cfg)
+        model.dacvae = _FakeDACVAE(
+            latent_dim=cfg.dit.latent_dim,
+            downsample_factor=cfg.audio_downsample_factor,
+        )
+        model._tokenizer = _MockTokenizer()
+        model._caption_tokenizer = _MockTokenizer()
+        return model
+
+    def _latents(self, model, caption, **kwargs):
+        cfg = model.config
+        ref_latent = mx.random.normal((1, 4, cfg.dit.latent_dim), key=mx.random.key(1))
+        ref_mask = mx.ones((1, 4), dtype=mx.bool_)
+        latent, _ = model.generate_latents(
+            "こんにちは",
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption=caption,
+            rng_seed=0,
+            seconds=1.0,
+            **kwargs,
+        )
+        mx.eval(latent)
+        return latent
+
+    def test_rollback_with_speaker_and_caption_cfg(self):
+        # cond + text + speaker + caption: 4 bundles
+        model = self._make_model()
+        latent = self._latents(
+            model, "穏やかな声", speaker_kv_scale=1.5, speaker_kv_min_t=0.9
+        )
+        self.assertTrue(bool(mx.all(mx.isfinite(latent))))
+
+    def test_rollback_without_caption(self):
+        # empty caption is masked, so cond + text + speaker: 3 bundles
+        model = self._make_model()
+        latent = self._latents(model, "", speaker_kv_scale=1.5, speaker_kv_min_t=0.9)
+        self.assertTrue(bool(mx.all(mx.isfinite(latent))))
+
+    def test_unit_scale_rollback_matches_plain_kv_cache(self):
+        model = self._make_model()
+        plain = self._latents(model, "穏やかな声", context_kv_cache=True)
+        rolled = self._latents(
+            model, "穏やかな声", speaker_kv_scale=1.0, speaker_kv_min_t=0.9
+        )
+        self.assertTrue(bool(mx.allclose(plain, rolled)))
+
+
 # ---------------------------------------------------------------------------
 # Irodori-TTS v4: shared pretrained (ModernBERT) text/caption encoder
 # ---------------------------------------------------------------------------
@@ -6838,16 +6972,18 @@ class TestMossTTSRegistration(unittest.TestCase):
             ("moss_tts_local", ["OpenMOSS-Team", "MOSS-TTS"]),
         ]
 
-        for expected_model_type, model_name in cases:
-            arch, model_type = get_model_class(
-                model_type=expected_model_type,
-                model_name=model_name,
-                category="tts",
-                model_remapping=MODEL_REMAPPING,
-            )
+        for config_model_type, model_name in cases:
+            for name_parts in (model_name, None, [], ["checkpoint"], ["kokoro"]):
+                with self.subTest(model_type=config_model_type, model_name=name_parts):
+                    arch, model_type = get_model_class(
+                        model_type=config_model_type,
+                        model_name=name_parts,
+                        category="tts",
+                        model_remapping=MODEL_REMAPPING,
+                    )
 
-            self.assertEqual(model_type, expected_model_type)
-            self.assertIs(arch.Model, SharedModel)
+                    self.assertEqual(model_type, "moss_tts")
+                    self.assertIs(arch.Model, SharedModel)
 
 
 class TestMisoTTSRegistration(unittest.TestCase):
@@ -10668,6 +10804,24 @@ def test_reference_latent_conditioning_appends_asymmetric_mask():
     )
 
 
+def test_bf16_latent_keeps_float32_positions_for_every_frame():
+    shape = AudioLatentShape.from_duration(batch=1, duration=20.0)
+    tools = AudioLatentTools(AudioPatchifier(), shape)
+    state = tools.create_initial_state(dtype=mx.bfloat16)
+    ref = mx.zeros((1, 8, 250, 16), dtype=mx.bfloat16)
+    state = append_reference_latent(state, tools, ref)
+
+    # The frame times the RoPE sees (generate_freqs takes the middle of each bound).
+    middle = (state.positions[..., 0] + state.positions[..., 1]) / 2
+    middle = np.array(middle.astype(mx.float32))[0, 0]
+    target, reference = middle[:500], middle[500:]
+    assert np.all(np.diff(target) > 0), "adjacent frames share a time stamp"
+    np.testing.assert_allclose(np.diff(target)[1:], 0.04, atol=1e-4)
+    np.testing.assert_allclose(reference - target[:250], 0.5, atol=1e-4)
+    assert state.latent.dtype == mx.bfloat16
+    assert state.positions.dtype == mx.float32
+
+
 def _expected_ltx2_sigmas(steps, latent_shape):
     tokens = math.prod(latent_shape[2:])
     sigmas = np.linspace(1.0, 0.0, steps + 1, dtype=np.float32)
@@ -10827,6 +10981,36 @@ def test_embeddings_connector_compacts_left_padded_tokens_like_reference():
     np.testing.assert_allclose(np.array(replaced[0, 0]), [3.0, 4.0], atol=1e-6)
     np.testing.assert_allclose(np.array(replaced[0, 1]), [30.0, 40.0], atol=1e-6)
     np.testing.assert_array_equal(np.array(returned_mask), np.zeros((1, 1, 1, 2)))
+
+
+def test_embeddings_connector_keeps_every_token_of_bf16_prompt():
+    # Gemma prompts are left padded to 1024 tokens, past where bf16 counts by one.
+    length = 1024
+    connector = Embeddings1DConnector(
+        attention_head_dim=2,
+        num_attention_heads=1,
+        num_layers=0,
+        num_learnable_registers=128,
+    )
+    connector.learnable_registers = mx.full((128, 2), -1.0, dtype=mx.bfloat16)
+    index = np.arange(length)
+    # Tag each slot with its index, split so that bf16 holds it exactly.
+    hidden = mx.array(np.stack([index // 32, index % 32], axis=-1)[None])
+    hidden = hidden.astype(mx.bfloat16)
+
+    for valid in (29, 46, 300):
+        binary_mask = mx.array((index >= length - valid)[None], dtype=mx.int32)
+        additive_mask = binary_to_additive_attention_mask(
+            binary_mask, dtype=mx.bfloat16
+        )
+        replaced, _ = connector._replace_padded_with_learnable_registers(
+            hidden, additive_mask
+        )
+        replaced = np.array(replaced.astype(mx.float32))[0]
+        kept = replaced[:, 0] * 32 + replaced[:, 1]
+
+        np.testing.assert_array_equal(kept[:valid], index[length - valid :])
+        np.testing.assert_array_equal(kept[valid:], -33.0)
 
 
 def test_dramabox_text_conditioner_small_path_shapes():
