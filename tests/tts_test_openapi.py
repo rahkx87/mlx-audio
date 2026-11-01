@@ -1,9 +1,9 @@
-import time
-
-import httpx
 import re
+import time
 from pathlib import Path
 from urllib.parse import unquote
+
+import httpx
 
 BASE_URL = "http://localhost:7860"
 TTS_ENDPOINT = "/v1/audio/speech"
@@ -23,7 +23,9 @@ def _extract_filename(headers, default="output.wav"):
         return default
 
     # Prefer filename* (RFC 5987 style, e.g.: filename*=UTF-8''my%20file.wav)
-    match = re.search(r"filename\*\s*=\s*([^;,\s]+)", content_disposition, flags=re.IGNORECASE)
+    match = re.search(
+        r"filename\*\s*=\s*([^;,\s]+)", content_disposition, flags=re.IGNORECASE
+    )
     if match:
         value = match.group(1).strip()
         if "''" in value:
@@ -32,7 +34,11 @@ def _extract_filename(headers, default="output.wav"):
         return unquote(value)
 
     # Standard filename parameter, e.g.: filename="audio.wav" or filename=audio.wav
-    match = re.search(r"filename\s*=\s*([\"']?[^\"';,\s]+[\"']?)", content_disposition, flags=re.IGNORECASE)
+    match = re.search(
+        r"filename\s*=\s*([\"']?[^\"';,\s]+[\"']?)",
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
     if match:
         value = match.group(1).strip()
 
@@ -68,9 +74,9 @@ def upload_voice(
                     files={"audio_sample": (sample_path.name, sample, "audio/wav")},
                 )
 
-    assert response.status_code == 200, (
-        f"Voice upload failed: {response.status_code} {response.text}"
-    )
+    assert (
+        response.status_code == 200
+    ), f"Voice upload failed: {response.status_code} {response.text}"
     body = response.json()
     assert body["object"] == "audio.voice", body
     assert body["name"] == name, body

@@ -33,6 +33,7 @@ Generate natural-sounding speech from text. Multiple models with multilingual su
 | **rumik-oss 1** | 3B expressive multilingual Indic TTS with 22-language support, description-conditioned delivery and inline vocalizations | 22 Indic languages + EN | [rumik-ai/rumik-oss-1](https://huggingface.co/rumik-ai/rumik-oss-1), [8bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-8bit), [4bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-4bit) |
 | **VoxCPM2** | 2B tokenizer-free TTS with 48kHz output, voice design, voice cloning, and continuation | 30 languages | [bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16), [8bit](https://huggingface.co/mlx-community/VoxCPM2-8bit), [4bit](https://huggingface.co/mlx-community/VoxCPM2-4bit) |
 | **CSM / MisoTTS** | Sesame-style conversational speech models with voice cloning | EN | [mlx-community/csm-1b](https://huggingface.co/mlx-community/csm-1b), [MisoTTS bf16](https://huggingface.co/mlx-community/MisoLabs-MisoTTS-bf16), [MisoTTS 8bit](https://huggingface.co/mlx-community/MisoLabs-MisoTTS-8bit) |
+| **Maya2 Native** | Streaming TTS with 20 voices and voice cloning | 11 Indic languages + EN | [maya-research/maya2-native](https://huggingface.co/maya-research/maya2-native) |
 | **Dia** | Dialogue-focused TTS | EN | [mlx-community/Dia-1.6B-fp16](https://huggingface.co/mlx-community/Dia-1.6B-fp16) |
 | **Chatterbox** | Expressive multilingual TTS (v2/v3) | 23 languages | [v3](https://huggingface.co/mlx-community/chatterbox-multilingual-v3), [v2](https://huggingface.co/mlx-community/chatterbox-fp16) |
 | **KugelAudio** | 7B multilingual TTS for 24 European languages | 24 European languages | [kugelaudio/kugelaudio-0-open](https://huggingface.co/kugelaudio/kugelaudio-0-open) |
@@ -40,6 +41,7 @@ Generate natural-sounding speech from text. Multiple models with multilingual su
 | **OuteTTS** | Efficient TTS model | EN | [mlx-community/OuteTTS-1.0-0.6B-fp16](https://huggingface.co/mlx-community/OuteTTS-1.0-0.6B-fp16) |
 | **Spark** | SparkTTS model | EN, ZH | [mlx-community/Spark-TTS-0.5B-bf16](https://huggingface.co/mlx-community/Spark-TTS-0.5B-bf16) |
 | **Ming Omni TTS (BailingMM)** | Multimodal generation with voice cloning and style control | EN, ZH | [mlx-community/Ming-omni-tts-16.8B-A3B-bf16](https://huggingface.co/mlx-community/Ming-omni-tts-16.8B-A3B-bf16) |
+| **Ming-3.0 TTS (Dense)** | 0.5B multilingual TTS with voice cloning, built-in voices and style control | ZH, EN, DE, ES, FR, KO, JA | [mlx-community/Ming-3.0-tts-0.5B-bf16](https://huggingface.co/mlx-community/Ming-3.0-tts-0.5B-bf16) |
 | **Ming Omni TTS (Dense)** | Lightweight dense Ming Omni variant | EN, ZH | [mlx-community/Ming-omni-tts-0.5B-bf16](https://huggingface.co/mlx-community/Ming-omni-tts-0.5B-bf16) |
 
 [:octicons-arrow-right-24: Browse TTS Models](tts/index.md)
@@ -55,6 +57,7 @@ Transcribe and understand speech with state-of-the-art accuracy. Streaming suppo
 | **Whisper** | OpenAI's robust STT model | 99+ languages | [mlx-community/whisper-large-v3-turbo-asr-fp16](https://huggingface.co/mlx-community/whisper-large-v3-turbo-asr-fp16) |
 | **Distil-Whisper** | Distilled fast Whisper variants | EN | [distil-whisper/distil-large-v3](https://huggingface.co/distil-whisper/distil-large-v3) |
 | **Qwen3-ASR** | Alibaba's multilingual ASR | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-ASR-1.7B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit) |
+| **MiMo-V2.5-ASR** | Xiaomi's speech recognition model | ZH, EN | [MiMo-V2.5-ASR](https://huggingface.co/mlx-community/MiMo-V2.5-ASR-MLX) |
 | **Qwen3-ForcedAligner** | Word-level audio alignment | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-ForcedAligner-0.6B-8bit](https://huggingface.co/mlx-community/Qwen3-ForcedAligner-0.6B-8bit) |
 | **MOSS-Transcribe-Diarize** | End-to-end transcription with timestamps and speaker labels | Multiple major languages | https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize |
 | **Parakeet** | NVIDIA's accurate STT | EN (v2), 25 EU languages (v3) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) |
@@ -93,6 +96,7 @@ Transform, separate, and enhance audio.
 |-------|-------------|----------|------|
 | **SAM-Audio** | Text-guided source separation | Extract specific sounds | [mlx-community/sam-audio-large](https://huggingface.co/mlx-community/sam-audio-large) |
 | **Liquid2.5-Audio** | Speech-to-Speech, TTS, and STT | Speech interactions | [mlx-community/LFM2.5-Audio-1.5B-8bit](https://huggingface.co/mlx-community/LFM2.5-Audio-1.5B-8bit) |
+| **LFM3-Audio** | Speech-to-Speech, TTS, and STT | Multilingual speech and audio questions | [LiquidAI/LFM3-Audio-2B-MLX-8bit](https://huggingface.co/LiquidAI/LFM3-Audio-2B-MLX-8bit) |
 | **MossFormer2 SE** | Speech enhancement | Noise removal | [starkdmi/MossFormer2_SE_48K_MLX](https://huggingface.co/starkdmi/MossFormer2_SE_48K_MLX) |
 | **DeepFilterNet (1/2/3)** | Speech enhancement | Noise suppression | [mlx-community/DeepFilterNet-mlx](https://huggingface.co/mlx-community/DeepFilterNet-mlx) |
 
